@@ -30,7 +30,11 @@ export const useGameStore = defineStore('game', {
       });
       this.socket.on('room_info', (room) => { this.room = room; });
       this.socket.on('game_state', (state) => { this.state = state; });
-      this.socket.on('action_error', (e) => { this.error = e?.error || '操作失败'; setTimeout(() => { if (this.error === e.error) this.error = ''; }, 2600); });
+      this.socket.on('action_error', (e) => {
+        this.error = e?.error || '操作失败';
+        const msg = this.error;
+        setTimeout(() => { if (this.error === msg) this.error = ''; }, 2600);
+      });
     },
 
     joinRoom(roomId) {
@@ -48,9 +52,19 @@ export const useGameStore = defineStore('game', {
       });
     },
 
-    action(type, uid) {
+    // 角色选择：弃置/选择一张角色牌
+    pickSelect(key) {
+      this.socket.emit('pick_select', { key });
+    },
+
+    // 引擎询问响应（濒死救援/隐蛊/冰心诀/参战者指定/战牌等）
+    submitPending(answer) {
+      this.socket.emit('submit_pending', { answer });
+    },
+
+    action(type, opts = {}) {
       this.ensureSocket();
-      this.socket.emit('game_action', { type, uid });
+      this.socket.emit('game_action', { type, ...opts });
     },
 
     leaveAndReset() {

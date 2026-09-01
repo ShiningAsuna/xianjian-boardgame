@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS users (
 
 CREATE TABLE IF NOT EXISTS cards (
   id TEXT PRIMARY KEY,
-  type TEXT NOT NULL,          -- character | monster | event | skill
+  type TEXT NOT NULL,          -- character | monster | event | card(手牌)
   name TEXT NOT NULL,
   data TEXT NOT NULL           -- 定义 JSON，引擎读取的唯一事实来源
 );
@@ -38,24 +38,28 @@ CREATE TABLE IF NOT EXISTS matches (
 );
 `);
 
-// ---- 卡池导入 seed ----
+// ---- 卡池 seed：每次启动按当前卡池定义同步（upsert + 清理已删除的旧卡）----
 function seedCards() {
   const def = require('./data/cards');
   const insert = db.prepare(
-    'INSERT INTO cards (id, type, name, data) VALUES (?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET data = excluded.data'
+    'INSERT INTO cards (id, type, name, data) VALUES (?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET type=excluded.type, name=excluded.name, data=excluded.data'
   );
+  const seen = new Set();
   const tx = db.transaction(() => {
-    for (const c of def.characters) insert.run(c.id, 'character', c.name, JSON.stringify(c));
-    for (const m of def.monsters) insert.run(m.id, 'monster', m.name, JSON.stringify(m));
-    for (const e of def.events) insert.run(e.id, 'event', e.name, JSON.stringify(e));
-    for (const s of def.skills) insert.run(s.id, 'skill', s.name, JSON.stringify(s));
+    for (const c of def.characters) { insert.run(c.id, 'character', c.name, JSON.stringify(c)); seen.add(c.id); }
+    for (const m of def.monsters) { insert.run(m.id, 'monster', m.name, JSON.stringify(m)); seen.add(m.id); }
+    for (const e of def.events) { insert.run(e.id, 'event', e.name, JSON.stringify(e)); seen.add(e.id); }
+    for (const c of def.cards) { insert.run(String(c.id), 'card', c.name, JSON.stringify(c)); seen.add(String(c.id)); }
   });
   tx();
-  const n = db.prepare('SELECT COUNT(*) AS n FROM cards').get().n;
-  console.log(`[db] cards seeded: ${n}`);
-}
+  // 清理已下架的旧卡
+  const rows = db.prepare('SELECT id FROM cards').all();
+  const del = db.prepare('DELETE FROM cards WHERE id = ?');
+  for (const r of rows) if (!seen.has(r.id)) del.run(r.id);
 
-const cardCount = db.prepare('SELECT COUNT(*) AS n FROM cards').get().n;
-if (cardCount === 0) seedCards();
+  const n = db.prepare('SELECT COUNT(*) AS n FROM cards').get().n;
+  console.log(`[db] cards synced: ${n}`);
+}
+seedCards();
 
 module.exports = db;

@@ -1,4 +1,4 @@
-// Socket.IO 实时层：房间加入/开局/游戏动作/断线代管
+// Socket.IO 实时层：房间加入/开局/游戏动作/询问响应/断线代管
 const jwt = require('jsonwebtoken');
 const db = require('./db');
 const config = require('./config');
@@ -23,9 +23,8 @@ function setup(io) {
     const user = socket.user;
     console.log(`[io] ${user.username} connected (${socket.id})`);
 
-    // 广播等待中房间的最新座位给该房间所有连接
     function pushRoomInfo(room) {
-      if (!room.emitter) return;
+      if (!room?.emitter) return;
       for (const s of room.emitter.values()) s.emit('room_info', hub.lobbyView(room));
     }
 
@@ -62,24 +61,39 @@ function setup(io) {
       ack && ack({ ok: true });
     });
 
-    // 游戏动作统一入口：{ type: 'draw_event'|'skip_event'|'play_card'|'go_battle'|'flip_monster'|'finish_turn', uid? }
-    socket.on('game_action', ({ type, uid } = {}) => {
+    // 角色选择阶段：弃置/选择一张角色牌
+    socket.on('pick_select', ({ key } = {}) => {
+      const room = hub.rooms.get(socket.data.roomId);
+      if (!room || !room.game) return socket.emit('action_error', { error: '还没有开始对局。' });
+      const result = room.game.actionPickSelect(user.id, key);
+      if (!result.ok) socket.emit('action_error', { error: result.error });
+    });
+
+    // 引擎询问响应（隐蛊/冰心诀/濒死救援/参战者指定/战牌出牌/是否开战等）
+    socket.on('submit_pending', ({ answer } = {}) => {
+      const room = hub.rooms.get(socket.data.roomId);
+      if (!room || !room.game) return socket.emit('action_error', { error: '还没有开始对局。' });
+      const result = room.game.submitPending(user.id, answer);
+      if (!result.ok) socket.emit('action_error', { error: result.error });
+    });
+
+    // 游戏动作统一入口
+    socket.on('game_action', ({ type, uid, targetId, targetKind, toId } = {}) => {
       const room = hub.rooms.get(socket.data.roomId);
       if (!room || !room.game) return socket.emit('action_error', { error: '还没有开始对局。' });
       const g = room.game;
       const actions = {
         draw_event: () => g.actionDrawEvent(user.id),
         skip_event: () => g.actionSkipEvent(user.id),
-        play_card: () => g.actionPlayCard(user.id, uid),
+        play_card: () => g.actionPlayCard(user.id, uid, targetId ?? null, targetKind ?? null),
+        give_card: () => g.actionGiveCard(user.id, uid, toId),
         go_battle: () => g.actionGoBattle(user.id),
-        flip_monster: () => g.actionFlipMonster(user.id),
         finish_turn: () => g.actionFinishTurn(user.id),
       };
       const fn = actions[type];
       if (!fn) return socket.emit('action_error', { error: `未知动作: ${type}` });
       const result = fn();
       if (!result.ok) socket.emit('action_error', { error: result.error });
-      // 成功时的状态广播由引擎 onState 回调完成
     });
 
     socket.on('disconnect', () => {

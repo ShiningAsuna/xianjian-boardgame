@@ -11,7 +11,13 @@ const rooms = ref([]);
 const matches = ref([]);
 const showHistory = ref(false);
 const creating = ref(false);
-const form = reactive({ mode: 'pve', size: 4, name: '' });
+const form = reactive({
+  mode: 'pve',
+  size: 4,
+  name: '',
+  pickTotal: 12, // 抽取角色数 n（须为偶数）
+  pickOpen: 6,   // 明牌数 x
+});
 let timer = null;
 
 async function refresh() {
@@ -21,7 +27,11 @@ async function refresh() {
 async function createRoom() {
   creating.value = true;
   try {
-    const room = await api.createRoom({ ...form, name: form.name.trim() });
+    const room = await api.createRoom({
+      ...form,
+      name: form.name.trim(),
+      pickConfig: { total: Number(form.pickTotal), open: Number(form.pickOpen) },
+    });
     router.push(`/game/${room.id}`);
   } catch (e) {
     alert(e.message);
@@ -78,18 +88,34 @@ onUnmounted(() => clearInterval(timer));
           </label>
           <button class="btn primary" :disabled="creating" @click="createRoom">创建并进入</button>
         </div>
-        <p class="tip">规则速览：双阵营轮流行动，每回合依次经过【事件 → 技牌 → 战斗 → 补牌】四个阶段；战斗阶段翻开怪兽牌，战胜收为宠物，最终宠物战力总和高的阵营获胜。</p>
+        <div class="form-row">
+          <label>
+            抽取角色数 n（偶数）
+            <input v-model.number="form.pickTotal" type="number" min="6" max="12" step="2" />
+          </label>
+          <label>
+            明牌数 x
+            <input v-model.number="form.pickOpen" type="number" :min="0" :max="form.pickTotal" step="2" />
+          </label>
+          <label>
+            暗牌数 y（自动）
+            <input :value="Math.max(form.pickTotal - form.pickOpen, 0)" disabled />
+          </label>
+          <span class="pick-hint">角色牌库每种 2 份共 10 张，n 超出时自动收敛；双方各弃 1 张后交替轮选。</span>
+        </div>
+        <p class="tip">规则速览：开局先进行「角色选择阶段」（明暗牌 + 双方弃置 + 交替轮选）；每回合依次经过【事件 → 技牌 → 战斗 → 补牌】四阶段；战斗阶段含确认/参战者/翻取/出场/命中/战牌/结算/胜负 8 个子阶段；怪兽翻完比双方宠物总战力，或一方全灭即分胜负。</p>
       </section>
 
       <section class="panel block">
         <h2>等待中的房间（3 秒刷新）</h2>
         <table v-if="rooms.length" class="rooms">
-          <thead><tr><th>房间名</th><th>房主</th><th>模式</th><th>座位</th><th></th></tr></thead>
+          <thead><tr><th>房间名</th><th>房主</th><th>模式</th><th>角色配置</th><th>座位</th><th></th></tr></thead>
           <tbody>
             <tr v-for="r in rooms" :key="r.id">
               <td>{{ r.name }}</td>
               <td>{{ r.hostName }}</td>
               <td>{{ r.mode === 'pve' ? '人机' : '对战' }} · {{ r.size }} 人</td>
+              <td>抽{{ r.pickConfig?.total ?? '-' }}（明{{ r.pickConfig?.open ?? '-' }}/暗{{ (r.pickConfig?.total ?? 0) - (r.pickConfig?.open ?? 0) }}）</td>
               <td>{{ r.filled }}/{{ r.size }}</td>
               <td><button class="btn" @click="router.push(`/game/${r.id}`)">加入</button></td>
             </tr>
@@ -136,6 +162,8 @@ onUnmounted(() => clearInterval(timer));
 .form-row { display: flex; gap: 14px; align-items: end; flex-wrap: wrap; }
 .form-row label { display: flex; flex-direction: column; gap: 6px; font-size: 12px; color: var(--dim); }
 .form-row .grow { flex: 1; min-width: 220px; }
+.form-row input[type="number"] { width: 110px; }
+.pick-hint { font-size: 11.5px; color: var(--dim); align-self: center; max-width: 420px; line-height: 1.6; }
 .tip { color: var(--dim); font-size: 12.5px; line-height: 1.7; margin: 14px 0 0; }
 
 .rooms { width: 100%; border-collapse: collapse; font-size: 13.5px; }

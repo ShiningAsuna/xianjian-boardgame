@@ -11,7 +11,7 @@ class RoomManager {
     this.rooms = new Map(); // roomId -> room
   }
 
-  createRoom(hostUser, { size, mode, name }) {
+  createRoom(hostUser, { size, mode, name, pickConfig }) {
     if (!config.GAME_SIZES.includes(size)) size = 4;
     mode = mode === 'pvp' ? 'pvp' : 'pve';
     const id = crypto.randomUUID().slice(0, 8);
@@ -22,6 +22,10 @@ class RoomManager {
       hostName: hostUser.username,
       size,                 // 总座位数：4 或 6
       mode,                 // pvp: 坐满人开局(含补位bot)；pve: 创建即带 bot
+      pickConfig: {         // 角色选择配置：抽 n 张，明 x 暗 y
+        total: Number(pickConfig?.total) || 12,
+        open: Number(pickConfig?.open) || 6,
+      },
       status: 'waiting',    // waiting | playing | finished
       players: [{ id: hostUser.id, name: hostUser.username, isBot: false, online: true }],
       game: null,
@@ -74,6 +78,7 @@ class RoomManager {
       roomId: room.id,
       players: seats,
       mode: room.mode,
+      pickConfig: room.pickConfig,
       onState: () => this.broadcastState(room),
       onEnd: (record) => this.persistMatch(record),
     });
@@ -179,6 +184,7 @@ class RoomManager {
       filled: room.players.filter((p) => !p.isBot).length,
       mode: room.mode,
       status: room.status,
+      pickConfig: room.pickConfig,
       players: room.players.filter((p) => !p.isBot).map((p) => ({ id: p.id, name: p.name })),
     };
   }

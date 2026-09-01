@@ -1,60 +1,65 @@
 <script setup>
-// 通用卡面：四类卡共用（角/怪/事/技）
+// 通用卡面：角色/怪兽/事件/手牌（特殊·装备·技牌·战牌）
 const props = defineProps({
   card: { type: Object, required: true },
   mini: { type: Boolean, default: false },
 });
 
-const KIND_META = {
-  character: { badge: '角色', cls: 'face-character' },
-  monster:   { badge: '怪兽', cls: 'face-monster' },
-  event:     { badge: '事件', cls: 'face-event' },
-  skill_equip:   { badge: '装备', cls: 'face-skill-equip' },
-  skill_instant: { badge: '技法', cls: 'face-skill-instant' },
-};
+const TYPE_NAME = { 1: '特殊', 2: '装备', 3: '技牌', 4: '战牌' };
 
-// 手牌中的技牌实例不带 type 字段（引擎实例化时未注入），通过 kind 兜底识别
-const resolveType = () => {
-  if (props.card.type) return props.card.type;
-  if (props.card.kind) return 'skill';
-  return '';
-};
-
-const meta = () => {
-  const t = resolveType();
-  if (t === 'character') return KIND_META.character;
-  if (t === 'monster') return KIND_META.monster;
-  if (t === 'event') return KIND_META.event;
-  if (t === 'skill') return props.card.kind === 'equip' ? KIND_META.skill_equip : KIND_META.skill_instant;
-  return { badge: '卡牌', cls: '' };
-};
-
-const mainStat = () => {
+// 解析卡牌类别（手牌实例 type 为数字；图鉴数据带字符串 type）
+const kind = () => {
   const c = props.card;
-  const t = resolveType();
-  if (t === 'character') return `战力 ${c.power} · 血 ${c.hp}`;
-  if (t === 'monster') return `战力 ${c.power}`;
-  if (t === 'skill') return c.kind === 'equip' ? '挂场装备' : '打出生效';
-  if (t === 'event') return '回合开始可选';
+  if (typeof c.type === 'string') {
+    if (c.type === 'character') return 'character';
+    if (c.type === 'monster') return 'monster';
+    if (c.type === 'event') return 'event';
+    return 'card';
+  }
+  return 'card';
+};
+
+const cls = () => `face-${kind()}`;
+
+const badge = () => {
+  const c = props.card;
+  const k = kind();
+  if (k === 'character') return '角色';
+  if (k === 'monster') return `怪兽·${c.elements?.name || ''}`;
+  if (k === 'event') return '事件';
+  if (k === 'card') {
+    let t = TYPE_NAME[c.type] || '手牌';
+    if (c.type === 2) t += c.eqvType === 1 ? '·武器' : '·防具';
+    return t;
+  }
+  return '卡牌';
+};
+
+const stat = () => {
+  const c = props.card;
+  const k = kind();
+  if (k === 'character') return `体${c.hp} 力${c.power} 命中${c.range}`;
+  if (k === 'monster') return `力${c.power} 闪${c.range}${c.type === 3 ? ' ·BOSS' : c.type === 2 ? ' ·强敌' : ''}`;
+  if (k === 'event') return '回合开始可选';
   return '';
 };
 </script>
 
 <template>
-  <div class="card-face" :class="[meta().cls, { mini }]">
+  <div class="card-face" :class="[cls(), { mini }]">
     <div class="card-top">
-      <span class="badge">{{ meta().badge }}</span>
-      <span class="stat">{{ mainStat() }}</span>
+      <span class="badge">{{ badge() }}</span>
+      <span class="stat" v-if="stat()">{{ stat() }}</span>
     </div>
     <div class="card-name">{{ card.name }}</div>
-    <div class="card-desc">{{ card.desc }}</div>
+    <div class="card-desc">{{ card.desc || (kind() === 'monster' ? [card.appear, card.pets && `宠物：${card.pets}`, card.win && `胜：${card.win}`, card.lose && `败：${card.lose}`].filter(Boolean).join(' / ') : '') || (kind() === 'character' ? (card.skill || []).map((s) => `${s.name}：${s.desc}`).join('；') : '') }}</div>
   </div>
 </template>
 
 <style scoped>
 .card-face {
   position: relative;
-  width: 150px;
+  width: 158px;
   border-radius: 12px;
   padding: 10px 12px;
   border: 1px solid var(--panel-border);
@@ -64,23 +69,23 @@ const mainStat = () => {
   flex-direction: column;
   gap: 6px;
 }
-.mini { width: 108px; padding: 7px 9px; gap: 3px; }
+.mini { width: 112px; padding: 7px 9px; gap: 3px; }
 
-.card-top { display: flex; justify-content: space-between; align-items: center; }
+.card-top { display: flex; justify-content: space-between; align-items: center; gap: 6px; }
 .badge {
   font-size: 11px;
   padding: 1px 8px;
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.07);
   letter-spacing: 1px;
+  white-space: nowrap;
 }
-.stat { font-size: 11px; color: var(--gold); }
-.mini .stat { display: none; }
+.stat { font-size: 11px; color: var(--gold); white-space: nowrap; }
 
 .card-name { font-size: 16px; font-weight: 700; letter-spacing: 1px; }
 .mini .card-name { font-size: 13px; }
 
-.card-desc { font-size: 11px; line-height: 1.5; color: var(--dim); min-height: 30px; }
+.card-desc { font-size: 11px; line-height: 1.55; color: var(--dim); min-height: 30px; }
 .mini .card-desc { display: none; }
 
 .face-character { border-color: rgba(223, 187, 102, 0.65); box-shadow: inset 0 0 24px rgba(223, 187, 102, 0.09); }
@@ -89,6 +94,7 @@ const mainStat = () => {
 .face-monster .badge { color: var(--red); }
 .face-event { border-color: rgba(99, 169, 234, 0.55); box-shadow: inset 0 0 24px rgba(99, 169, 234, 0.1); }
 .face-event .badge { color: var(--blue); }
-.face-skill-equip, .face-skill-instant { border-color: rgba(55, 201, 154, 0.55); box-shadow: inset 0 0 24px rgba(55, 201, 154, 0.09); }
-.face-skill-equip .badge, .face-skill-instant .badge { color: var(--jade); }
+/* 手牌按颜色分类：特殊白 / 装备蓝 / 技牌绿 / 战牌红 */
+.face-card { border-color: rgba(150, 165, 190, 0.55); }
+.face-card .badge { color: #aab8d0; }
 </style>
