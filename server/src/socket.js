@@ -70,15 +70,22 @@ function setup(io) {
     });
 
     // 引擎询问响应（隐蛊/冰心诀/濒死救援/参战者指定/战牌出牌/是否开战等）
-    socket.on('submit_pending', ({ answer } = {}) => {
+    socket.on('submit_pending', ({ pendingId, answer } = {}) => {
       const room = hub.rooms.get(socket.data.roomId);
       if (!room || !room.game) return socket.emit('action_error', { error: '还没有开始对局。' });
-      const result = room.game.submitPending(user.id, answer);
+      const result = room.game.submitPending(user.id, pendingId, answer);
+      if (!result.ok) socket.emit('action_error', { error: result.error });
+    });
+
+    socket.on('use_character_skill', ({ key, args, pendingId } = {}) => {
+      const room = hub.rooms.get(socket.data.roomId);
+      if (!room || !room.game) return socket.emit('action_error', { error: '还没有开始对局。' });
+      const result = room.game.actionUseCharacterSkill(user.id, key, args || {}, pendingId || null);
       if (!result.ok) socket.emit('action_error', { error: result.error });
     });
 
     // 游戏动作统一入口
-    socket.on('game_action', ({ type, uid, targetId, targetKind, toId } = {}) => {
+    socket.on('game_action', ({ type, uid, targetId, targetKind, toId, key, args, pendingId } = {}) => {
       const room = hub.rooms.get(socket.data.roomId);
       if (!room || !room.game) return socket.emit('action_error', { error: '还没有开始对局。' });
       const g = room.game;
@@ -87,6 +94,7 @@ function setup(io) {
         skip_event: () => g.actionSkipEvent(user.id),
         play_card: () => g.actionPlayCard(user.id, uid, targetId ?? null, targetKind ?? null),
         give_card: () => g.actionGiveCard(user.id, uid, toId),
+        use_character_skill: () => g.actionUseCharacterSkill(user.id, key, args || {}, pendingId || null),
         go_battle: () => g.actionGoBattle(user.id),
         finish_turn: () => g.actionFinishTurn(user.id),
       };

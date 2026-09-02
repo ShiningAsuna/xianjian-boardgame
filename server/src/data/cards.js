@@ -5,7 +5,7 @@
 //
 // 字段说明：
 //   characters: hp 体力 / power 战力 / range 命中 / sex 1男2女 / loveById 倾慕者
-//               （XJ103 赵灵儿·梦蛇 为 XJ102 的变身形态，不进入角色选择池）
+//               canChoose为false选人时不进入可选角色池（XJ103 赵灵儿·梦蛇 为 XJ102 的变身形态，不进入角色选择池）
 //   monsters:   elements 五行 / power 战力 / range 闪避 / type 1弱2强3boss
 //               appear 出场效果 / pets 宠物效果 / win 胜利结算 / lose 失败结算（文本描述）
 //   events:     num 该事件牌数量
@@ -35,7 +35,7 @@ const characters = [
     loveById: ['XJ101'],
     skill: [
       { name: '双剑', desc: '您可同时装备两件武器，效果叠加' },
-      { name: '梦蛇', desc: '敌方合计拥有3个或以上宠物时，您变身为赵灵儿（梦蛇），当前HP不变' },
+      { name: '梦蛇', desc: '敌方合计拥有3个或以上宠物时，您变身为赵灵儿·梦蛇，当前HP不变' },
     ],
   },
   {
@@ -45,6 +45,7 @@ const characters = [
     power: 4,
     range: 5,
     sex: 2,
+    canChoose: false,
     loveById: ['XJ101'],
     skill: [
       { name: '双剑', desc: '您可同时装备两件武器，效果叠加' },
@@ -91,6 +92,111 @@ const characters = [
       { name: '醉仙望月步', desc: '您的战斗阶段中，您可以触发两次战斗，若只触发一次战斗，补牌阶段您多补1张牌' },
     ],
   },
+  {
+    id: 'XJ107',
+    name: '拜月教主',
+    hp: 8,
+    power: 3,
+    range: 3,
+    sex: 1,
+    loveById: ['MO016'],
+    skill: [
+      { name: '水魔兽合体', desc: '参与水、火属性怪物的战斗时，自身战力+2' },
+      { name: '召唤水魔兽', desc: '参战时（无论是否命中），战牌阶段可丢弃2张手牌，我方战力+5。若发动此技能，本场战斗中您不可使用战牌' },
+    ],
+  },
+  {
+    id: 'XJ201',
+    name: '王小虎',
+    hp: 11,
+    power: 2,
+    range: 3,
+    sex: 1,
+    loveById: ['XJ202', 'XJ203'],
+    skill: [
+      { name: '发挥不稳定', desc: '您在战斗开始阶段进行掷骰判定，本场战斗中您的战力=基础战力+骰子点数。6点算作1点' },
+      { name: '不屈不饶', desc: '您进行掷骰判定时，若对骰子点数不满意，每丢弃1张手牌或扣减1点HP可重投一次' },
+    ],
+  },
+  {
+    id: 'XJ202',
+    name: '苏媚',
+    hp: 7,
+    power: 3,
+    range: 3,
+    sex: 2,
+    loveById: ['XJ201'],
+    skill: [
+      { name: '狡猾', desc: '您触发战斗时，战斗开始阶段可丢弃此怪牌，重新翻取1张。每回合只能使用一次。若没有选择重新翻取，本次战斗您的战力+1' },
+      { name: '拒绝', desc: '您可以将任意特殊类手牌当做【冰心诀】使用' },
+    ],
+  },
+  {
+    id: 'XJ203',
+    name: '沈欺霜',
+    hp: 8,
+    power: 3,
+    range: 2,
+    sex: 2,
+    loveById: ['XJ201'],
+    skill: [
+      { name: '仙霞五奇', desc: '您在场时，若我方支援未命中或没有支援，触发者战力+3。若我方妨碍未命中或没有妨碍，怪物战力+3' },
+      { name: '元灵归心术', desc: '在您的技牌阶段，您每丢弃1张技牌，回复任意玩家2点HP' },
+    ],
+  },
+  {
+    id: 'XJ204',
+    name: '孔璘',
+    hp: 10,
+    power: 4,
+    range: 2,
+    sex: 1,
+    loveById: [],
+    skill: [
+      { name: '辣手摧花', desc: '您的技牌阶段，若您的HP大于等于2，您可选定一名在场女性角色，令其与您自己HP各-1，一回合不能对同一角色反复使用' },
+      { name: '生命献祭', desc: '您死亡后变为【魔尊】，装备、手牌、宠物保留' },
+    ],
+  },
+  {
+    id: 'XJ205',
+    name: '魔尊',
+    hp: 5,
+    power: 8,
+    range: 2,
+    sex: 1,
+    canChoose: false,
+    loveById: [],
+    skill: [
+      { name: '蓄势待发', desc: '您的回合开始阶段，您补充1张手牌' }
+    ],
+  },
+  {
+    id: 'XJ302',
+    name: '唐雪见',
+    hp: 6,
+    power: 2,
+    range: 4,
+    sex: 2,
+    loveById: [],
+    skill: [
+      { name: '追打', desc: '当有玩家HP减少时，您可丢弃1张手牌，本次HP减少的全部玩家（可能包括自己）HP额外-1 ' },
+      { name: '连击', desc: '战牌阶段，您每丢弃1张战牌以外的手牌，本次战斗内您的战力+2' },
+      { name: '好胜', desc: '您参战时，可在战牌阶段扣减自己2HP后，补2张牌，每场战斗只能使用一次。本伤害隐蛊无效' }
+    ],
+  },
+  {
+    id: 'XJ305',
+    name: '紫萱',
+    hp: 7,
+    power: 3,
+    range: 4,
+    sex: 2,
+    loveById: [],
+    skill: [
+      { name: '关爱', desc: '您在场时，我方每得到一个宠物，您指定一人补充2张手牌' },
+      { name: '连击', desc: '您拥有的宠物战力额外+3' },
+    ],
+  },
 ];
 
 // elements.id: 1雷 2风 3土 4水 5火；type: 1弱 2强 3boss
@@ -132,10 +238,20 @@ const monsters = [
     win: '无', lose: '您的角色横置',
   },
   {
+    id: 'MO016', name: '水魔兽', elements: { id: 4, name: '水' }, power: 7, range: 6, type: 3,
+    appear: '', pets: '主人战力+1，命中+1',
+    win: '敌人全体HP-1，之后您抽取妨碍者1件装备或手牌', lose: '您的HP-2，之后妨碍者抽取您的1件装备或手牌',
+  },
+  {
+    id: 'MO019', name: '狐妖女', elements: { id: 5, name: '火' }, power: 6, range: 1, type: 2,
+    appear: '支援者受到伤害，伤害=您（触发者）的战力-1', pets: '主人战力+2',
+    win: '妨碍者HP-3', lose: '由敌方指定两名角色HP-3',
+  },
+  {
     id: 'MO020', name: '熔岩兽王', elements: { id: 5, name: '火' }, power: 10, range: 4, type: 3,
     appear: '全体角色HP-2', pets: '主人战力+2',
     win: '敌方全体HP-2', lose: '您与支援者HP各-2',
-  },
+  }
 ];
 
 // 事件牌：effect 逻辑见 rules.js EVENT_EFFECTS
@@ -165,7 +281,7 @@ const cards = [
   { id: 2, name: '灵葫仙丹', type: 1, desc: '您的技牌阶段使用，您自己的HP+2。当有玩家HP为0时使用，可令其复活并恢复2点HP', num: 3 },
   { id: 3, name: '隐蛊', type: 1, desc: '抵消一次您自己受到的HP伤害（倾慕除外）', num: 4 },
   { id: 5, name: '魔刀天吒', type: 2, eqvType: 1, desc: '战力+2', num: 1 },
-  { id: 6, name: '无尘剑', type: 2, eqvType: 1, desc: '战力+1', num: 1 },
+  { id: 6, name: '无尘剑', type: 2, eqvType: 1, desc: '战力+1，命中+1', num: 1 },
   { id: 8, name: '彩环', type: 2, eqvType: 1, desc: '命中+2', num: 1 },
   { id: 10, name: '五彩霞衣', type: 2, eqvType: 2, desc: '战力+1 爆发：装备后，您HP为0时，可丢弃五彩霞衣，复活并恢复2点HP。', num: 1 },
   { id: 11, name: '乾坤道袍', type: 2, eqvType: 2, desc: '战力+1 装备后，您免疫技牌导致的HP伤害', num: 1 },

@@ -17,10 +17,10 @@ const { CARD_TYPE, EQV_TYPE } = R;
 let uidSeq = 0;
 const nextUid = (tag, id) => `${tag}${id}_${++uidSeq}`;
 
-function shuffle(arr) {
+function shuffle(arr, random = Math.random) {
   const a = arr.slice();
   for (let i = a.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
+    const j = Math.floor(random() * (i + 1));
     [a[i], a[j]] = [a[j], a[i]];
   }
   return a;
@@ -37,6 +37,7 @@ class XianjianGame {
     this.size = opts.players.length;
     this.onState = opts.onState;
     this.onEnd = opts.onEnd || null;
+    this.random = typeof opts.random === 'function' ? opts.random : Math.random;
 
     // 房间配置：抽取角色数 / 明牌数 / 暗牌数
     this.pickConfig = this._normalizePickConfig(opts.pickConfig, this.size);
@@ -45,10 +46,12 @@ class XianjianGame {
     this.result = null;
     this.phase = 'pick';
     this.logEntries = [];
-    this.pending = null;      // 当前等待响应的询问 {seatId,kind,data,resolve,timer,deadline}
+    this.pending = null;      // 当前等待响应的询问 {id,seatId,kind,data,validate,resolve,timer,deadline}
     this.battle = null;       // 战斗上下文
     this._busy = false;       // 引擎互斥锁
     this._botToken = 0;
+    this._dyingSeats = new Set();
+    this._damageSeq = 0;
     this.startedAt = new Date().toISOString();
 
     // ---- 座位 ----
@@ -70,38 +73,36 @@ class XianjianGame {
 
     // ---- 牌堆 ----
     // 怪兽牌/事件牌一次性使用（不洗回）；手牌弃牌堆可洗回
-    this.monsterDeck = shuffle(R.defs.monsters.map((d) => this.instantiateMonster(d)));
+    this.monsterDeck = shuffle(R.defs.monsters.map((d) => this.instantiateMonster(d)), this.random);
     this.monsterDiscard = [];
-    this.eventDeck = shuffle(R.defs.events.flatMap((d) => Array.from({ length: d.num || 1 }, () => ({ ...d, uid: nextUid('ev', d.id) }))));
+    this.eventDeck = shuffle(R.defs.events.flatMap((d) => Array.from({ length: d.num || 1 }, () => ({ ...d, uid: nextUid('ev', d.id) }))), this.random);
     this.eventDiscard = [];
-    this.skillDeck = shuffle(R.defs.cards.flatMap((d) => Array.from({ length: d.num || 1 }, () => this.instantiateCard(d))));
+    this.skillDeck = shuffle(R.defs.cards.flatMap((d) => Array.from({ length: d.num || 1 }, () => this.instantiateCard(d))), this.random);
     this.discardPile = [];
 
     // 角色牌库：每种角色 2 份（梦蛇为变身形态，不进选择池）
-    const rolePoolDefs = R.defs.characters.filter((c) => c.id !== 'XJ103');
-    this.roleLibrary = shuffle(rolePoolDefs.flatMap((d) => Array.from({ length: 2 }, () => ({ ...d }))));
+    const rolePoolDefs = R.defs.characters.filter((c) => c.canChoose !== false);
+    this.roleLibrary = shuffle(rolePoolDefs.flatMap((d) => Array.from({ length: 2 }, () => ({ ...d }))), this.random);
 
     // ---- 掷骰子定先手 ----
-    const rollA = 1 + Math.floor(Math.random() * 6);
-    const rollB = 1 + Math.floor(Math.random() * 6);
-    this.dice = { a: rollA, b: rollB };
-    this.firstFaction = rollA >= rollB ? 'a' : 'b';
+    let rollA;
+    let rollB;
+    let rerolls = 0;
+    do {
+      rollA = 1 + Math.floor(this.random() * 6);
+      rollB = 1 + Math.floor(this.random() * 6);
+      if (rollA === rollB) rerolls++;
+    } while (rollA === rollB);
+    this.dice = { a: rollA, b: rollB, rerolls };
+    this.firstFaction = rollA > rollB ? 'a' : 'b';
 
-    // 行动顺序：两阵营交替（先手方排头）
-    const orderA = shuffle(this.seats.filter((s) => s.faction === 'a')).map((s) => s.id);
-    const orderB = shuffle(this.seats.filter((s) => s.faction === 'b')).map((s) => s.id);
-    const first = this.firstFaction === 'a' ? orderA : orderB;
-    const second = this.firstFaction === 'a' ? orderB : orderA;
-    this.turnOrder = [];
-    for (let i = 0; i < Math.max(first.length, second.length); i++) {
-      if (first[i] !== undefined) this.turnOrder.push(first[i]);
-      if (second[i] !== undefined) this.turnOrder.push(second[i]);
-    }
+    // 选将完成后由先手阵营决策人指定；此处仅准备合法的默认顺序供 Bot/超时使用。
+    this.turnOrder = this._defaultAlternatingOrder();
     this.turnIdx = 0;
 
     // ---- 角色选择阶段状态 ----
     const { total, open } = this.pickConfig;
-    const drawn = shuffle(this.roleLibrary).slice(0, total);
+    const drawn = shuffle(this.roleLibrary, this.random).slice(0, total);
     this.pick = {
       pool: drawn.map((c, i) => ({
         key: `pk_${i}`,
@@ -111,6 +112,7 @@ class XianjianGame {
       })),
       steps: this._buildPickSteps(total),
       stepIdx: 0,
+      stepTaken: 0,
       factionRoles: { a: [], b: [] },
     };
 
@@ -124,7 +126,7 @@ class XianjianGame {
   instantiateMonster(def) { return { ...def, uid: nextUid('m', def.id) }; }
 
   _normalizePickConfig(cfg = {}, size) {
-    const libSize = (R.defs.characters.length - 1) * 2; // 梦蛇除外，每种2份
+    const libSize = R.defs.characters.filter((c) => c.canChoose !== false).length * 2;
     let total = Number(cfg.total) || 12;
     // n 至少覆盖“双方各弃1 + 每名玩家1张”，且不超过牌库
     const min = size + 2;
@@ -158,16 +160,36 @@ class XianjianGame {
     return steps;
   }
 
+  _defaultAlternatingOrder() {
+    const first = this.seats.filter((seat) => seat.faction === this.firstFaction).map((seat) => seat.id);
+    const second = this.seats.filter((seat) => seat.faction !== this.firstFaction).map((seat) => seat.id);
+    return first.flatMap((id, index) => [id, second[index]]).filter(Boolean);
+  }
+
+  _validTurnOrder(order) {
+    if (!Array.isArray(order) || order.length !== this.seats.length || new Set(order).size !== order.length) return false;
+    if (!order.every((id) => this.seatById(id))) return false;
+    return order.every((id, index) => this.seatById(id).faction === (index % 2 === 0 ? this.firstFaction : this.enemyFactionOf(this.firstFaction)));
+  }
+
   // ================= 查询工具 =================
   seatById(id) { return this.seats.find((s) => s.id === id); }
   currentSeat() { return this.seatById(this.turnOrder[this.turnIdx]); }
   aliveSeats(fk) { return this.seats.filter((s) => s.alive && (!fk || s.faction === fk)); }
   enemyFactionOf(fk) { return fk === 'a' ? 'b' : 'a'; }
   factionName(fk) { return config.FACTIONS.find((f) => f.key === fk)?.name || fk; }
-  factionDecider(fk) { return this.aliveSeats(fk)[0] || null; } // 阵营决策人（行动序第一位）
+  factionDecider(fk) {
+    return this.turnOrder.map((id) => this.seatById(id)).find((seat) => seat?.alive && seat.faction === fk)
+      || this.aliveSeats(fk)[0]
+      || null;
+  }
+  petScore(seat) {
+    const base = seat.pets.reduce((value, pet) => value + pet.power, 0);
+    return base + (seat.char?.id === 'XJ305' ? seat.pets.length * 3 : 0);
+  }
   factionScore(fk) {
-    return this.seats.filter((s) => s.faction === fk)
-      .reduce((sum, s) => sum + s.pets.reduce((x, p) => x + p.power, 0), 0);
+    return this.seats.filter((seat) => seat.faction === fk)
+      .reduce((sum, seat) => sum + this.petScore(seat), 0);
   }
   isCombatant(seat, battle) {
     if (!battle) return false;
@@ -220,25 +242,49 @@ class XianjianGame {
   hasSkill(seat, name) { return (seat.char?.skill || []).some((s) => s.name === name); }
 
   // ================= 询问（pending）=================
-  ask(seatId, { kind, data = {}, timeoutMs = 15000, botFn }) {
+  _defaultPendingValidate(kind, data, answer) {
+    if (['yes_no', 'battle_confirm', 'use_card', 'use_equip_burst', 'use_pet_burst'].includes(kind)) {
+      return typeof answer === 'boolean';
+    }
+    if (['pick_supporter', 'pick_obstructer', 'war_pick_player'].includes(kind)) {
+      return Array.isArray(data.candidates) && data.candidates.includes(answer);
+    }
+    if (kind === 'war_play_card') {
+      if (!answer || typeof answer !== 'object') return false;
+      if (answer.pass === true) return true;
+      const legal = Array.isArray(data.legal) ? data.legal : [];
+      const option = legal.find((item) => item.uid === answer.uid);
+      if (!option) return false;
+      return !option.needTargetSide || answer.targetSide === 'a' || answer.targetSide === 'b';
+    }
+    return false;
+  }
+
+  ask(seatId, { kind, data = {}, timeoutMs = 15000, botFn, validate = null }) {
     return new Promise((resolve) => {
       const seat = this.seatById(seatId);
       const wrap = {
-        seatId, kind, data,
+        id: crypto.randomUUID(),
+        seatId,
+        kind,
+        data,
+        validate: validate || ((answer) => this._defaultPendingValidate(kind, data, answer)),
         deadline: Date.now() + timeoutMs,
-        resolve: (ans) => { clearTimeout(wrap.timer); this.pending = null; resolve(ans); this.emit(); },
+        resolve: (answer) => {
+          clearTimeout(wrap.timer);
+          if (this.pending === wrap) this.pending = null;
+          resolve(answer);
+          this.emit();
+        },
         timer: null,
       };
       wrap.timer = setTimeout(() => {
-        if (this.pending === wrap) {
-          const def = botFn ? botFn() : null;
-          this.log(`（${seat.name} 响应超时，自动处理）`);
-          wrap.resolve(def);
-        }
+        if (this.pending !== wrap) return;
+        this.log(`（${seat?.name || seatId} 响应超时，自动处理）`);
+        wrap.resolve(botFn ? botFn() : null);
       }, timeoutMs);
       this.pending = wrap;
       this.emit();
-      // Bot 立即按策略决策
       if (seat?.isBot || seat?.offline) {
         setTimeout(() => {
           if (this.pending === wrap) wrap.resolve(botFn ? botFn() : null);
@@ -247,31 +293,113 @@ class XianjianGame {
     });
   }
 
-  submitPending(playerId, answer) {
-    const p = this.pending;
-    if (!p || p.seatId !== playerId) return { ok: false, error: '当前没有等待您的询问。' };
-    p.resolve(answer);
+  submitPending(playerId, pendingId, answer) {
+    const pending = this.pending;
+    if (!pending || pending.seatId !== playerId) return { ok: false, error: '当前没有等待您的询问。' };
+    if (!pendingId || pending.id !== pendingId) return { ok: false, error: '询问已过期，请按最新状态重新操作。' };
+    if (pending.validate && !pending.validate(answer)) return { ok: false, error: '提交内容不在服务端允许的候选范围内。' };
+    pending.resolve(answer);
     return { ok: true };
   }
 
   async askChoosePlayer(seat, candidates, { reason, optional = false } = {}) {
-    if (!candidates.length) return null;
-    const list = candidates.map((s) => s.id);
-    const ans = await this.ask(seat.id, {
+    const list = candidates.filter((candidate) => candidate?.alive).map((candidate) => candidate.id);
+    if (!list.length) return null;
+    const answer = await this.ask(seat.id, {
       kind: 'choose_player',
       data: { reason, candidates: list, optional },
+      validate: (value) => (optional && value == null) || list.includes(value),
       botFn: () => list[0],
     });
-    return this.seatById(ans) || null;
+    return list.includes(answer) ? this.seatById(answer) : null;
   }
 
-  async askYesNo(seat, { reason }) {
-    const ans = await this.ask(seat.id, {
+  async askChoosePlayers(seat, candidates, count, { reason } = {}) {
+    const list = candidates.filter((candidate) => candidate?.alive).map((candidate) => candidate.id);
+    const actualCount = Math.min(Math.max(0, count), list.length);
+    if (!actualCount) return [];
+    const answer = await this.ask(seat.id, {
+      kind: 'choose_players',
+      data: { reason, candidates: list, min: actualCount, max: actualCount },
+      validate: (value) => Array.isArray(value) && value.length === actualCount
+        && new Set(value).size === actualCount && value.every((id) => list.includes(id)),
+      botFn: () => list.slice(0, actualCount),
+    });
+    return Array.isArray(answer) ? answer.map((id) => this.seatById(id)).filter(Boolean) : [];
+  }
+
+  async askChooseCards(seat, cards, count, { reason, min = count, max = count } = {}) {
+    const list = cards.map((card) => card.uid);
+    if (list.length < min) return [];
+    const answer = await this.ask(seat.id, {
+      kind: 'choose_cards',
+      data: {
+        reason,
+        options: cards.map((card) => ({ uid: card.uid, name: card.name, type: card.type })),
+        min,
+        max,
+      },
+      validate: (value) => Array.isArray(value) && value.length >= min && value.length <= max
+        && new Set(value).size === value.length && value.every((uid) => list.includes(uid)),
+      botFn: () => list.slice(0, count),
+    });
+    return answer.map((uid) => cards.find((card) => card.uid === uid)).filter(Boolean);
+  }
+
+  async askChooseZone(seat, zones, { reason } = {}) {
+    if (!zones.length) return null;
+    const answer = await this.ask(seat.id, {
+      kind: 'choose_zone',
+      data: { reason, zones },
+      validate: (value) => zones.includes(value),
+      botFn: () => zones[0],
+    });
+    return zones.includes(answer) ? answer : null;
+  }
+
+  async askChoosePet(seat, pets, { reason } = {}) {
+    if (!pets.length) return null;
+    const options = pets.map((pet) => ({ uid: pet.uid, name: pet.name, element: pet.elements.name, power: pet.power }));
+    const answer = await this.ask(seat.id, {
+      kind: 'choose_pet',
+      data: { reason, options },
+      validate: (value) => options.some((option) => option.uid === value),
+      botFn: () => pets.slice().sort((a, b) => b.power - a.power)[0].uid,
+    });
+    return pets.find((pet) => pet.uid === answer) || null;
+  }
+
+  async stealRandomFromNonEmptyZone(receiver, source, reason) {
+    if (!receiver?.alive || !source?.alive) return null;
+    const zones = [];
+    if (source.hand.length) zones.push('hand');
+    if (source.equips.length) zones.push('equip');
+    const zone = await this.askChooseZone(receiver, zones, { reason });
+    if (zone === 'hand' && source.hand.length) {
+      const index = Math.floor(this.random() * source.hand.length);
+      const [card] = source.hand.splice(index, 1);
+      receiver.hand.push(card);
+      this.log(`${receiver.name} 从 ${source.name} 的手牌区随机抽取了1张牌。`);
+      return card;
+    }
+    if (zone === 'equip' && source.equips.length) {
+      const index = Math.floor(this.random() * source.equips.length);
+      const [equip] = source.equips.splice(index, 1);
+      receiver.hand.push(equip.card);
+      this.log(`${receiver.name} 从 ${source.name} 的装备区随机抽取了【${equip.card.name}】并收入手牌。`);
+      return equip.card;
+    }
+    return null;
+  }
+
+  async askYesNo(seat, { reason, defaultValue = true } = {}) {
+    const answer = await this.ask(seat.id, {
       kind: 'yes_no',
       data: { reason },
-      botFn: () => true,
+      validate: (value) => typeof value === 'boolean',
+      botFn: () => defaultValue,
     });
-    return !!ans;
+    return answer === true;
   }
 
   // ================= 摸牌 / 伤害 / 濒死 =================
@@ -280,7 +408,7 @@ class XianjianGame {
     for (let i = 0; i < n; i++) {
       if (!this.skillDeck.length) {
         if (!this.discardPile.length) break;
-        this.skillDeck = shuffle(this.discardPile);
+        this.skillDeck = shuffle(this.discardPile, this.random);
         this.discardPile = [];
         this.log('手牌弃牌堆已洗回抽牌堆。');
       }
@@ -290,119 +418,203 @@ class XianjianGame {
     return drawn;
   }
 
-  /** 统一伤害入口：隐蛊抵消 → 乾坤道袍免疫技牌伤害 → 扣血 → 濒死结算 */
-  async damage(seat, amount, { source = null, kind = 'skill', element = null, fromLove = false } = {}) {
-    if (this.over || !seat.alive || amount <= 0) return false;
+  /** 单体伤害也走事务入口，保证追打、批量伤害和濒死只结算一次。 */
+  async damage(seat, amount, options = {}) {
+    const transaction = await this.damageBatch([{ seat, amount }], options);
+    return transaction.deadIds.includes(seat?.id);
+  }
 
-    // 隐蛊：抵消一次自己受到的HP伤害（倾慕除外）
-    if (!fromLove) {
-      const hiddenGu = seat.hand.find((c) => c.id === 3);
+  async damageBatch(entries, { source = null, kind = 'skill', element = null, fromLove = false, bypassHidden = false, noChase = false } = {}) {
+    const transaction = {
+      id: `damage_${++this._damageSeq}`,
+      sourceId: source?.id || null,
+      kind,
+      actualIds: [],
+      deadIds: [],
+    };
+    for (const entry of entries) {
+      const seat = entry?.seat;
+      const amount = Number(entry?.amount) || 0;
+      const lost = await this._applyDamageWithoutDying(seat, amount, { source, kind, element, fromLove, bypassHidden });
+      if (lost > 0 && !transaction.actualIds.includes(seat.id)) transaction.actualIds.push(seat.id);
+    }
+
+    if (!noChase && transaction.actualIds.length) {
+      const originalVictims = transaction.actualIds.map((id) => this.seatById(id)).filter(Boolean);
+      for (const tang of this.aliveSeats().filter((seat) => seat.char?.id === 'XJ302' && seat.hp > 0 && seat.hand.length)) {
+        const chosen = await this.askChooseCards(tang, tang.hand.slice(), 0, {
+          reason: `【追打】可弃 1 张手牌，令本次实际掉血的 ${originalVictims.map((seat) => seat.name).join('、')} 各额外HP-1`,
+          min: 0,
+          max: 1,
+        });
+        if (!chosen.length) continue;
+        const card = chosen[0];
+        const index = tang.hand.findIndex((item) => item.uid === card.uid);
+        if (index < 0) continue;
+        tang.hand.splice(index, 1);
+        this.discardPile.push(card);
+        this.log(`【追打】${tang.name} 弃置【${card.name}】，本次实际掉血的全部角色额外HP-1。`);
+        for (const victim of originalVictims) {
+          const lost = await this._applyDamageWithoutDying(victim, 1, { source: tang, kind: 'skill' });
+          if (lost > 0 && !transaction.actualIds.includes(victim.id)) transaction.actualIds.push(victim.id);
+        }
+      }
+    }
+
+    this.lastDamage = { id: transaction.id, sourceId: transaction.sourceId, kind, actualIds: transaction.actualIds.slice() };
+    for (const id of transaction.actualIds) {
+      const victim = this.seatById(id);
+      if (victim?.alive && victim.hp <= 0 && !this._dyingSeats.has(id)) {
+        const died = await this.dyingProcess(victim, fromLove);
+        if (died) transaction.deadIds.push(id);
+      }
+    }
+    return transaction;
+  }
+
+  async _applyDamageWithoutDying(seat, amount, { kind, element, fromLove, bypassHidden }) {
+    if (this.over || !seat?.alive || amount <= 0) return 0;
+    if (!fromLove && !bypassHidden) {
+      const hiddenGu = seat.hand.find((card) => card.id === 3);
       if (hiddenGu) {
         const use = await this.ask(seat.id, {
           kind: 'use_card',
           data: { reason: `是否使用【隐蛊】抵消这 ${amount} 点伤害？`, cardUid: hiddenGu.uid },
           botFn: () => amount >= 2,
         });
-        if (use) {
+        if (use && seat.hand.includes(hiddenGu)) {
           seat.hand.splice(seat.hand.indexOf(hiddenGu), 1);
+          this.log(`${seat.name} 使用【隐蛊】响应伤害。`);
+          const cancelled = await this._askCounter(seat, hiddenGu);
           this.discardPile.push(hiddenGu);
-          this.log(`${seat.name} 使用【隐蛊】，抵消了 ${amount} 点伤害。`);
-          return false;
+          if (!cancelled) {
+            this.log(`【隐蛊】生效，${seat.name} 抵消了 ${amount} 点伤害。`);
+            return 0;
+          }
+          this.log(`【隐蛊】被反制，伤害继续结算。`);
         }
       }
     }
-
-    // 乾坤道袍：免疫技牌导致的HP伤害
-    if (kind === 'skill' && seat.equips.some((e) => e.card.id === 11)) {
+    if (kind === 'skill' && seat.equips.some((equip) => equip.card.id === 11)) {
       this.log(`${seat.name} 身着【乾坤道袍】，免疫技牌伤害。`);
-      return false;
+      return 0;
     }
-
     seat.hp -= amount;
-    this.log(`${seat.name} 受到 ${amount} 点${element ? element + '属性' : ''}伤害，剩余气血 ${Math.max(seat.hp, 0)}。`);
-    if (seat.hp > 0) return false;
-    return await this.dyingProcess(seat, fromLove);
+    this.log(`${seat.name} 受到 ${amount} 点${element ? `${element}属性` : ''}伤害，剩余气血 ${Math.max(seat.hp, 0)}。`);
+    return amount;
   }
 
-  /** 濒死结算：灵葫仙丹 → 五彩霞衣爆发 → 蝶精爆发 → 倾慕者 → 阵亡。返回是否死亡 */
+  /** 濒死结算：仙丹 → 装备/宠物爆发 → 倾慕者 → 生命献祭 → 阵亡。 */
   async dyingProcess(seat, fromLove = false) {
-    this.log(`${seat.name} 的【${seat.char?.name || '?'}】进入濒死！`);
-    this.emit();
+    if (!seat?.alive || seat.hp > 0 || this._dyingSeats.has(seat.id)) return false;
+    this._dyingSeats.add(seat.id);
+    try {
+      this.log(`${seat.name} 的【${seat.char?.name || '?'}】进入濒死！`);
+      this.emit();
 
-    // 1) 灵葫仙丹：所有存活玩家依次可救（濒死者优先）
-    const saviors = this.aliveSeats();
-    saviors.sort((x, y) => (x.id === seat.id ? -1 : y.id === seat.id ? 1 : 0));
-    for (const s of saviors) {
-      const pill = s.hand.find((c) => c.id === 2);
-      if (!pill) continue;
-      const use = await this.ask(s.id, {
-        kind: 'use_card',
-        data: { reason: `${seat.name} 濒死，是否使用【灵葫仙丹】令其复活并恢复 2 点HP？`, cardUid: pill.uid },
-        botFn: () => (s.id === seat.id || s.faction === seat.faction),
-      });
-      if (use) {
-        s.hand.splice(s.hand.indexOf(pill), 1);
+      const saviors = this.aliveSeats().sort((a, b) => (a.id === seat.id ? -1 : b.id === seat.id ? 1 : 0));
+      for (const savior of saviors) {
+        const pill = savior.hand.find((card) => card.id === 2);
+        if (!pill) continue;
+        const use = await this.ask(savior.id, {
+          kind: 'use_card',
+          data: { reason: `${seat.name} 濒死，是否使用【灵葫仙丹】令其恢复 2 点HP？`, cardUid: pill.uid },
+          botFn: () => savior.id === seat.id || savior.faction === seat.faction,
+        });
+        if (!use || !savior.hand.includes(pill)) continue;
+        savior.hand.splice(savior.hand.indexOf(pill), 1);
+        this.log(`${savior.name} 使用【灵葫仙丹】响应濒死。`);
+        const cancelled = await this._askCounter(savior, pill);
         this.discardPile.push(pill);
-        seat.hp = 2;
-        this.log(`${s.name} 使用【灵葫仙丹】，${seat.name} 复活并恢复至 2 点HP！`);
+        if (cancelled) continue;
+        seat.hp = Math.min(2, seat.maxHp);
+        this.log(`【灵葫仙丹】生效，${seat.name} 恢复至 ${seat.hp} 点HP。`);
         return false;
       }
-    }
 
-    // 2) 五彩霞衣爆发：自己弃衣复活+2HP
-    const robe = seat.equips.find((e) => e.card.id === 10);
-    if (robe) {
-      const use = await this.ask(seat.id, {
-        kind: 'use_equip_burst',
-        data: { reason: '是否爆发【五彩霞衣】？丢弃后复活并恢复 2 点HP。', cardUid: robe.card.uid },
-        botFn: () => true,
-      });
-      if (use) {
-        this.unequip(seat, robe);
-        this.discardPile.push(robe.card);
-        seat.hp = 2;
-        this.log(`${seat.name} 爆发【五彩霞衣】，复活并恢复至 2 点HP！`);
-        return false;
+      const robe = seat.equips.find((equip) => equip.card.id === 10);
+      if (robe) {
+        const use = await this.ask(seat.id, {
+          kind: 'use_equip_burst',
+          data: { reason: '是否爆发【五彩霞衣】？丢弃后恢复 2 点HP。', cardUid: robe.card.uid },
+          botFn: () => true,
+        });
+        if (use && seat.equips.includes(robe)) {
+          this.unequip(seat, robe);
+          this.discardPile.push(robe.card);
+          seat.hp = Math.min(2, seat.maxHp);
+          this.log(`${seat.name} 爆发【五彩霞衣】，恢复至 ${seat.hp} 点HP！`);
+          return false;
+        }
       }
-    }
 
-    // 3) 蝶精爆发：蝶精主人弃蝶精，令濒死者满血复活
-    for (const s of this.aliveSeats()) {
-      const butterfly = s.pets.find((p) => p.id === 'MO008');
-      if (!butterfly) continue;
-      const use = await this.ask(s.id, {
-        kind: 'use_pet_burst',
-        data: { reason: `是否爆发【蝶精】？放弃蝶精，令 ${seat.name} 满HP复活。`, petUid: butterfly.uid },
-        botFn: () => (s.faction === seat.faction || s.id === seat.id),
-      });
-      if (use) {
-        s.pets.splice(s.pets.indexOf(butterfly), 1);
+      for (const owner of this.aliveSeats()) {
+        const butterfly = owner.pets.find((pet) => pet.id === 'MO008');
+        if (!butterfly) continue;
+        const use = await this.ask(owner.id, {
+          kind: 'use_pet_burst',
+          data: { reason: `是否爆发【蝶精】令 ${seat.name} 满HP复活？`, petUid: butterfly.uid },
+          botFn: () => owner.faction === seat.faction || owner.id === seat.id,
+        });
+        if (!use || !owner.pets.includes(butterfly)) continue;
+        owner.pets.splice(owner.pets.indexOf(butterfly), 1);
         this.monsterDiscard.push(butterfly);
         seat.hp = seat.maxHp;
-        this.log(`${s.name} 爆发【蝶精】，${seat.name} 满HP复活！`);
+        this.log(`${owner.name} 爆发【蝶精】，${seat.name} 满HP复活！`);
         await this.checkTransform();
         return false;
       }
-    }
 
-    // 4) 倾慕者结算
-    const loverIds = seat.char?.loveById || [];
-    const lover = this.aliveSeats().find((s) => s.id !== seat.id && loverIds.includes(s.char?.id));
-    if (lover) {
-      this.log(`${lover.name}（${lover.char.name}）是 ${seat.name} 的倾慕者，必须扣减 1 点体力相救！`);
-      seat.hp = 1;
-      this.emit();
-      await this.damage(lover, 1, { kind: 'love', fromLove: true });
-      this.log(`${seat.name} 被倾慕者救回，体力回到 1。`);
-      return false;
-    }
+      const loverIds = seat.char?.loveById || [];
+      const characterLovers = this.aliveSeats().filter((lover) => lover.id !== seat.id
+        && loverIds.includes(lover.char?.id) && !lover._loveUsed);
+      const monsterLovers = this.seats.flatMap((owner) => owner.pets
+        .filter((pet) => loverIds.includes(pet.id) && !pet.loveUsed)
+        .map((pet) => ({ owner, pet })));
+      const choices = [
+        ...characterLovers.map((lover) => ({ key: `seat:${lover.id}`, name: `${lover.name}（${lover.char.name}）` })),
+        ...monsterLovers.map(({ owner, pet }) => ({ key: `pet:${pet.uid}`, name: `${owner.name}的宠物【${pet.name}】` })),
+      ];
+      if (choices.length) {
+        const answer = await this.ask(seat.id, {
+          kind: 'choose_lover',
+          data: { reason: '选择一名尚未相救过的倾慕者', options: choices },
+          validate: (value) => choices.some((choice) => choice.key === value),
+          botFn: () => choices[0].key,
+        });
+        const character = characterLovers.find((lover) => `seat:${lover.id}` === answer);
+        const monsterEntry = monsterLovers.find(({ pet }) => `pet:${pet.uid}` === answer);
+        seat.hp = 1;
+        if (character) {
+          character._loveUsed = true;
+          this.log(`${character.name}（${character.char.name}）作为倾慕者相救，必须扣减 1 点体力。`);
+          await this.damage(character, 1, { kind: 'love', fromLove: true, noChase: true });
+        } else if (monsterEntry) {
+          monsterEntry.pet.loveUsed = true;
+          this.log(`${monsterEntry.owner.name}的宠物【${monsterEntry.pet.name}】作为倾慕者相救，不扣减HP。`);
+        }
+        this.log(`${seat.name} 被倾慕者救回，体力回到 1。`);
+        return false;
+      }
 
-    // 5) 阵亡
-    seat.alive = false;
-    this.log(`【${seat.char?.name}】${seat.name} 阵亡了……（宠物战力仍计入阵营）`);
-    await this.checkTransform();
-    await this.checkFactionWiped();
-    return true;
+      if (seat.char?.id === 'XJ204') {
+        const demon = R.defs.characters.find((character) => character.id === 'XJ205');
+        seat.char = demon;
+        seat.maxHp = 5;
+        seat.hp = 5;
+        seat.sex = demon.sex;
+        this.log(`【生命献祭】${seat.name} 变为【魔尊】，恢复至 5/5 HP，手牌、装备与宠物全部保留。`);
+        return false;
+      }
+
+      seat.alive = false;
+      this.log(`【${seat.char?.name}】${seat.name} 阵亡了……（宠物战力仍计入阵营）`);
+      await this.checkTransform();
+      await this.checkFactionWiped();
+      return true;
+    } finally {
+      this._dyingSeats.delete(seat.id);
+    }
   }
 
   // ================= 变身（赵灵儿 ↔ 梦蛇）=================
@@ -440,7 +652,7 @@ class XianjianGame {
     if (this.phase !== 'pick' || !this.pickStep) return { ok: false, error: '当前不在角色选择阶段。' };
     const seat = this.seatById(playerId);
     if (!seat || seat.faction !== this.pickStep.side) return { ok: false, error: '当前不是您阵营的选择回合。' };
-    const item = this.pick.pool.find((p) => p.key === key && p.owner === null);
+    const item = this.pick.pool.find((entry) => entry.key === key && entry.owner === null);
     if (!item) return { ok: false, error: '该角色牌不可选。' };
 
     const step = this.pickStep;
@@ -453,31 +665,53 @@ class XianjianGame {
       this.log(`${this.factionName(seat.faction)}选择了${item.open ? `【${item.card.name}】` : '一张暗牌'}。`);
     }
 
-    this.pick.stepIdx++;
+    this.pick.stepTaken++;
+    if (this.pick.stepTaken >= step.count) {
+      this.pick.stepIdx++;
+      this.pick.stepTaken = 0;
+    }
     if (this.pick.stepIdx >= this.pick.steps.length) {
-      this._finishPick();
+      this.phase = 'pick_order';
+      this.emit();
+      this._finishPick().catch((error) => console.error('[engine] finish pick failed:', error));
     } else {
       this.emit();
     }
     return { ok: true };
   }
 
-  /** 选牌结束：分配角色到玩家（每人1张，多余进阵营备用区） */
-  _finishPick() {
-    for (const fk of ['a', 'b']) {
-      const members = this.seats.filter((s) => s.faction === fk);
-      const roles = this.pick.factionRoles[fk];
-      members.forEach((m, i) => {
-        const role = roles[i];
-        if (role) this._assignRole(m, role);
+  /** 选牌结束：分配角色，并由先手阵营决策人指定完整交替行动顺序。 */
+  async _finishPick() {
+    for (const faction of ['a', 'b']) {
+      const members = this.seats.filter((seat) => seat.faction === faction);
+      const roles = this.pick.factionRoles[faction];
+      members.forEach((member, index) => {
+        if (roles[index]) this._assignRole(member, roles[index]);
       });
-      // 多余角色留在阵营备用区（框架占位，不参与战斗）
       const spare = roles.slice(members.length);
-      if (spare.length) this.log(`${this.factionName(fk)}的备用角色：${spare.map((r) => r.name).join('、')}（暂不上场）。`);
+      if (spare.length) this.log(`${this.factionName(faction)}的备用角色：${spare.map((role) => role.name).join('、')}（暂不上场）。`);
     }
-    for (const s of this.seats) this.drawCards(s, HAND_START);
+
+    const decider = this.seats.find((seat) => seat.faction === this.firstFaction);
+    const fallback = this._defaultAlternatingOrder();
+    const order = await this.ask(decider.id, {
+      kind: 'choose_turn_order',
+      data: {
+        reason: '请指定完整行动顺序：先手阵营开始，两个阵营必须严格交替。',
+        candidates: this.seats.map((seat) => seat.id),
+        firstFaction: this.firstFaction,
+        count: this.seats.length,
+      },
+      validate: (value) => this._validTurnOrder(value),
+      botFn: () => fallback,
+    });
+    this.turnOrder = this._validTurnOrder(order) ? order.slice() : fallback;
+    this.turnIdx = 0;
+    for (const seat of this.seats) this.drawCards(seat, HAND_START);
+    this.log(`行动顺序：${this.turnOrder.map((id, index) => `${index + 1}号 ${this.seatById(id).name}`).join('；')}。`);
     this.log('角色选择结束，所有角色已就位，对局正式开始！');
     this.phase = 'event';
+    await this._onTurnStart(this.currentSeat());
     this.log(`—— 轮到 ${this.currentSeat().name}（${this.currentSeat().char.name}）的回合 ——`);
     this.emit();
   }
@@ -502,7 +736,7 @@ class XianjianGame {
 
   actionDrawEvent(playerId) {
     const seat = this._guard(playerId, 'event');
-    if (!seat) return { ok: false, error: '现在无法抽取事件牌。' };
+    if (!seat || this._eventBusy || this._busy) return { ok: false, error: '现在无法抽取事件牌。' };
     if (!this.eventDeck.length) {
       this.log('事件牌堆已空，跳过事件阶段。');
       this.phase = 'skill';
@@ -529,59 +763,99 @@ class XianjianGame {
 
   actionSkipEvent(playerId) {
     const seat = this._guard(playerId, 'event');
-    if (!seat) return { ok: false, error: '现在不是你的事件阶段。' };
+    if (!seat || this._eventBusy || this._busy) return { ok: false, error: '现在不是你的事件阶段。' };
     this.log(`${seat.name} 跳过了事件阶段。`);
     this.phase = 'skill';
     this.emit();
     return { ok: true };
   }
 
-  /** 技牌阶段：出技牌/装备/特殊牌(灵葫仙丹自用)；带 targetId 的技牌由前端附带目标 */
+  /** 技牌阶段：所有目标、区域和资源均在耗牌前校验。 */
   actionPlayCard(playerId, uid, targetId = null, targetKind = null) {
     const seat = this._guard(playerId, 'skill');
-    if (!seat) return { ok: false, error: '现在无法出牌。' };
-    const idx = seat.hand.findIndex((c) => c.uid === uid);
-    if (idx < 0) return { ok: false, error: '手牌不存在。' };
-    const card = seat.hand[idx];
-    if (card.type === CARD_TYPE.WAR) return { ok: false, error: '战牌只能在战斗的战牌阶段使用。' };
-    if (card.type !== CARD_TYPE.EQUIP && card.type !== CARD_TYPE.SKILL && card.type !== CARD_TYPE.SPECIAL) {
-      return { ok: false, error: '无法使用此牌。' };
+    if (!seat || this._busy) return { ok: false, error: '现在无法出牌。' };
+    const card = seat.hand.find((item) => item.uid === uid);
+    if (!card) return { ok: false, error: '手牌不存在。' };
+    const validation = this._validateSkillPhaseCard(seat, card, targetId, targetKind);
+    if (!validation.ok) return validation;
+
+    this._runLocked(async () => {
+      const index = seat.hand.findIndex((item) => item.uid === uid);
+      if (index < 0) return;
+      const target = targetId != null ? this.seatById(targetId) : null;
+      if (card.type === CARD_TYPE.EQUIP) {
+        seat.hand.splice(index, 1);
+        this._equip(seat, card);
+      } else {
+        seat.hand.splice(index, 1);
+        this.log(`${seat.name} 使用了【${card.name}】。`);
+        const cancelled = await this._askCounter(seat, card);
+        if (!cancelled) {
+          const def = card.type === CARD_TYPE.SKILL ? R.SKILL_CARDS[card.id] : R.SPECIAL_CARDS[card.id];
+          try { await def.run(this, { seat, target, targetKind }); }
+          catch (error) { console.error('[engine] card effect failed:', error); }
+        }
+        this.discardPile.push(card);
+      }
+      await this.checkFactionWiped();
+      if (!this.over) this.emit();
+    });
+    return { ok: true };
+  }
+
+  _validateSkillPhaseCard(seat, card, targetId, targetKind) {
+    if (card.type === CARD_TYPE.WAR) return { ok: false, error: '战牌只能在战牌阶段使用。' };
+    if (card.type === CARD_TYPE.EQUIP) return { ok: true };
+    if (card.type === CARD_TYPE.SPECIAL) {
+      return R.SPECIAL_CARDS[card.id] ? { ok: true } : { ok: false, error: '该特殊牌不能在此时使用。' };
+    }
+    if (card.type !== CARD_TYPE.SKILL || !R.SKILL_CARDS[card.id]) return { ok: false, error: '无法使用此牌。' };
+    const target = this.seatById(targetId);
+    if (!target?.alive) return { ok: false, error: '目标必须存在且存活。' };
+    if (card.id === 16 && !target.hand.length) return { ok: false, error: '目标没有可抽取的手牌。' };
+    if (card.id === 17) {
+      if (!['hand', 'equip'].includes(targetKind)) return { ok: false, error: '必须指定手牌区或装备区。' };
+      if (targetKind === 'hand' && !target.hand.length) return { ok: false, error: '目标手牌区为空。' };
+      if (targetKind === 'equip' && !target.equips.length) return { ok: false, error: '目标装备区为空。' };
+    }
+    return { ok: true };
+  }
+
+  actionUseCharacterSkill(playerId, key, args = {}, pendingId = null) {
+    if (this.pending?.seatId === playerId && ['character_skill', 'war_character_skill'].includes(this.pending.kind)) {
+      return this.submitPending(playerId, pendingId, { ...(args || {}), key });
+    }
+    const seat = this._guard(playerId, 'skill');
+    if (!seat || this._busy) return { ok: false, error: '现在无法发动角色技能。' };
+
+    if (key === 'yuanling_heal' && seat.char?.id === 'XJ203') {
+      const card = seat.hand.find((item) => item.uid === args.cardUid);
+      const target = this.seatById(args.targetId);
+      if (!card || card.type !== CARD_TYPE.SKILL) return { ok: false, error: '必须弃置一张有效技牌。' };
+      if (!target?.alive) return { ok: false, error: '回复目标必须存在且存活。' };
+      seat.hand.splice(seat.hand.indexOf(card), 1);
+      this.discardPile.push(card);
+      target.hp = Math.min(target.maxHp, target.hp + 2);
+      this.log(`【元灵归心术】${seat.name} 弃置【${card.name}】，令 ${target.name} 回复2点HP。`);
+      this.emit();
+      return { ok: true };
     }
 
-    (async () => {
-      await this._runLocked(async () => {
-        const target = targetId != null ? this.seatById(targetId) : null;
-        if (card.type === CARD_TYPE.EQUIP) {
-          seat.hand.splice(idx, 1);
-          this._equip(seat, card);
-        } else if (card.type === CARD_TYPE.SKILL) {
-          const def = R.SKILL_CARDS[card.id];
-          if (def?.needTarget && !target) { this.emit(); return; }
-          seat.hand.splice(idx, 1);
-          this.log(`${seat.name} 使用了【${card.name}】。`);
-          // 冰心诀响应窗口
-          const cancelled = await this._askCounter(seat, card);
-          if (!cancelled) {
-            try { await def?.run(this, { seat, target, targetKind }); } catch (e) { console.error('[engine] skill card failed:', e); }
-          }
-          this.discardPile.push(card);
-        } else {
-          // 特殊牌：灵葫仙丹自用
-          const def = R.SPECIAL_CARDS[card.id];
-          if (!def) { this.emit(); return; }
-          seat.hand.splice(idx, 1);
-          this.log(`${seat.name} 使用了【${card.name}】。`);
-          const cancelled = await this._askCounter(seat, card);
-          if (!cancelled) {
-            try { await def.run(this, { seat }); } catch (e) { console.error('[engine] special card failed:', e); }
-          }
-          this.discardPile.push(card);
-        }
-        await this.checkFactionWiped();
-        if (!this.over) this.emit();
+    if (key === 'kong_lash' && seat.char?.id === 'XJ204') {
+      const target = this.seatById(args.targetId);
+      if (seat.hp < 2) return { ok: false, error: 'HP不足，无法发动【辣手摧花】。' };
+      if (!target?.alive || target.sex !== 2) return { ok: false, error: '目标必须是在场的女性角色。' };
+      if (seat._lashTargets?.has(target.id)) return { ok: false, error: '本回合不能对同一角色重复发动。' };
+      if (!seat._lashTargets) seat._lashTargets = new Set();
+      seat._lashTargets.add(target.id);
+      this._runLocked(async () => {
+        this.log(`【辣手摧花】${seat.name} 与 ${target.name} 各HP-1。`);
+        await this.damageBatch([{ seat, amount: 1 }, { seat: target, amount: 1 }], { source: seat, kind: 'skill' });
+        this.emit();
       });
-    })();
-    return { ok: true };
+      return { ok: true };
+    }
+    return { ok: false, error: '该角色当前没有可发动的此项技能。' };
   }
 
   /** 阿奴·鬼灵精：技牌阶段把手牌交给他人 */
@@ -624,31 +898,57 @@ class XianjianGame {
     this.log(`${seat.name} 装备了${slot}【${card.name}】（${card.desc}）。`);
   }
 
-  /** 冰心诀响应：其他拥有冰心诀的玩家可令此牌无效。返回是否被抵消 */
+  /** 冰心诀连续反制链；苏媚可将任意特殊牌当作冰心诀。奇数次反制时原牌无效。 */
   async _askCounter(playSeat, card) {
-    for (const s of this.aliveSeats()) {
-      if (s.id === playSeat.id) continue;
-      const bing = s.hand.find((c) => c.id === 1);
-      if (!bing) continue;
-      const use = await this.ask(s.id, {
-        kind: 'use_card',
-        data: { reason: `${playSeat.name} 使用了【${card.name}】，是否打出【冰心诀】令其无效？`, cardUid: bing.uid },
-        botFn: () => s.faction !== playSeat.faction && Math.random() < 0.5,
-      });
-      if (use) {
-        s.hand.splice(s.hand.indexOf(bing), 1);
-        this.discardPile.push(bing);
-        this.log(`${s.name} 打出【冰心诀】，${playSeat.name} 的【${card.name}】被无效！`);
-        return true;
+    let currentSeat = playSeat;
+    let currentCard = card;
+    let counterCount = 0;
+    while (!this.over) {
+      let response = null;
+      for (const seat of this._orderedAliveSeats()) {
+        if (seat.id === currentSeat.id) continue;
+        const options = seat.hand.filter((candidate) => candidate.id === 1
+          || (seat.char?.id === 'XJ202' && candidate.type === CARD_TYPE.SPECIAL));
+        if (!options.length) continue;
+        const answer = await this.ask(seat.id, {
+          kind: 'counter_card',
+          data: {
+            reason: `${currentSeat.name} 打出【${currentCard.name}】，是否反制？`,
+            options: options.map((candidate) => ({
+              uid: candidate.uid,
+              name: candidate.name,
+              as: candidate.id === 1 ? '冰心诀' : '拒绝',
+            })),
+            optional: true,
+          },
+          validate: (value) => value == null || options.some((candidate) => candidate.uid === value),
+          botFn: () => (seat.faction !== currentSeat.faction && this.random() < 0.5 ? options[0].uid : null),
+        });
+        const responseCard = options.find((candidate) => candidate.uid === answer);
+        if (!responseCard || !seat.hand.includes(responseCard)) continue;
+        seat.hand.splice(seat.hand.indexOf(responseCard), 1);
+        this.discardPile.push(responseCard);
+        counterCount++;
+        this.log(`${seat.name} ${responseCard.id === 1 ? '打出【冰心诀】' : `以【拒绝】将【${responseCard.name}】当作【冰心诀】`}，反制【${currentCard.name}】。`);
+        response = { seat, card: responseCard };
+        break;
       }
+      if (!response) break;
+      currentSeat = response.seat;
+      currentCard = response.card;
     }
-    return false;
+    return counterCount % 2 === 1;
+  }
+
+  _orderedAliveSeats() {
+    const ordered = this.turnOrder.map((id) => this.seatById(id)).filter((seat) => seat?.alive);
+    return ordered.length ? ordered : this.aliveSeats();
   }
 
   /** 技牌阶段 → 战斗阶段 */
   actionGoBattle(playerId) {
     const seat = this._guard(playerId, 'skill');
-    if (!seat) return { ok: false, error: '现在不在技牌阶段。' };
+    if (!seat || this._busy) return { ok: false, error: '现在不在技牌阶段。' };
     this.phase = 'battle';
     this.emit();
     (async () => { await this._runLocked(() => this.runBattlePhase(seat)); })();
@@ -658,58 +958,63 @@ class XianjianGame {
   // ================= 战斗阶段（8 子阶段）=================
   get b() { return this.battle; }
 
-  async runBattlePhase(trigger) {
+  async runBattlePhase(trigger, { skipConfirm = false, extraBattle = false } = {}) {
     if (this.over) return;
     const battle = {
       trigger,
       supporter: null,
       obstructer: null,
       monster: null,
-      stage: 'confirm',   // confirm|roles|flip|appear|hit|cards|resolve|settle
+      stage: skipConfirm ? 'roles' : 'confirm',
       skipped: false,
       escaped: false,
+      monsterClaimed: false,
       supporterHit: false,
       obstructerHit: false,
       supporterBonus: 0,
+      characterPowerBonus: {},
       warBonus: { a: 0, b: 0 },
       warPersonal: {},
       warDouble: {},
+      skillUses: {},
+      rolls: {},
       actedWar: [],
       firstWarSide: null,
       winnerSide: null,
-      extraBattle: false, // 酒剑仙第二次战斗标记
+      extraBattle,
     };
     this.battle = battle;
     this.emit();
 
-    // —— ① 开始确认阶段：双方阵营决定是否开战（任一方拒绝则跳过）
+    // —— ① 开始确认阶段：第二战复用同一流程，但跳过重复确认。
     const enemySide = this.enemyFactionOf(trigger.faction);
-    const dA = this.factionDecider(trigger.faction);
-    const dB = this.factionDecider(enemySide);
-    const openA = dA ? await this.ask(dA.id, {
-      kind: 'battle_confirm',
-      data: { reason: `是否对即将翻开的怪兽开启战斗？（不开战则怪兽直接弃置，且您方触发者本回合只能补 1 张牌）` },
-      botFn: () => Math.random() < 0.85,
-    }) : false;
-    const openB = dB ? await this.ask(dB.id, {
-      kind: 'battle_confirm',
-      data: { reason: `对方阵营触发了战斗，是否同意开战？（不开战则怪兽直接弃置，对方补牌减为 1 张）` },
-      botFn: () => Math.random() < 0.7,
-    }) : false;
-
-    if (!openA || !openB) {
-      this.log(`${!openA ? this.factionName(trigger.faction) : this.factionName(enemySide)}选择不开战，怪兽牌堆顶的怪兽直接进入弃牌堆。`);
-      const mon = this.monsterDeck.pop();
-      if (mon) this.monsterDiscard.push(mon);
-      battle.skipped = true;
-      battle.stage = 'done';
-      this.battle = null;
-      trigger._battleSkipped = true;
-      this.phase = 'draw';
-      this.log(`${trigger.name} 本回合跳过了战斗，补牌阶段只能补 1 张牌。`);
-      this.emit();
-      await this._settleIfMonsterEmpty();
-      return;
+    if (!skipConfirm) {
+      const triggerDecider = this.factionDecider(trigger.faction);
+      const enemyDecider = this.factionDecider(enemySide);
+      const openTrigger = triggerDecider ? await this.ask(triggerDecider.id, {
+        kind: 'battle_confirm',
+        data: { reason: '是否对即将翻开的怪兽开启战斗？（不开战则怪兽弃置，触发者本回合只补1张牌）' },
+        botFn: () => this.random() < 0.85,
+      }) : false;
+      const openEnemy = enemyDecider ? await this.ask(enemyDecider.id, {
+        kind: 'battle_confirm',
+        data: { reason: '对方触发了战斗，是否同意开战？（不开战则怪兽弃置，对方补牌减为1张）' },
+        botFn: () => this.random() < 0.7,
+      }) : false;
+      if (!openTrigger || !openEnemy) {
+        this.log(`${!openTrigger ? this.factionName(trigger.faction) : this.factionName(enemySide)}选择不开战，怪兽牌堆顶的怪兽直接进入弃牌堆。`);
+        const monster = this.monsterDeck.pop();
+        if (monster) this.monsterDiscard.push(monster);
+        battle.skipped = true;
+        battle.stage = 'done';
+        this.battle = null;
+        trigger._battleSkipped = true;
+        this.phase = 'draw';
+        this.log(`${trigger.name} 本回合跳过了战斗，补牌阶段只能补 1 张牌。`);
+        this.emit();
+        await this._settleIfMonsterEmpty();
+        return;
+      }
     }
 
     // —— ② 指定参战者阶段：触发方选支援者（己方队友），对方选妨碍者
@@ -750,15 +1055,17 @@ class XianjianGame {
       return;
     }
     battle.monster = this.monsterDeck.pop();
-    const mon = battle.monster;
+    let mon = battle.monster;
     this.lastMonster = { name: mon.name, power: mon.power, element: mon.elements.name, by: trigger.name };
     this.log(`翻取阶段：翻开了怪兽【${mon.name}】（${mon.elements.name}属性·战力${mon.power}·闪避${mon.range}·${mon.type === 3 ? 'BOSS' : mon.type === 2 ? '强敌' : '小怪'}）！`);
     this.emit();
 
-    // 飞龙探云手：我方参战者、怪物闪避≤2 → 抽妨碍者手牌
-    for (const s of this.aliveSeats()) {
-      if (R.skillsOf(s).onBattleFlip && this.isCombatant(s, battle) && s.faction === trigger.faction) {
-        try { await R.skillsOf(s).onBattleFlip(this, s, battle); } catch (e) { console.error(e); }
+    await this._runBattleStartSkills(battle);
+    mon = battle.monster;
+    for (const seat of this.aliveSeats()) {
+      const skills = R.skillsOf(seat);
+      if (skills.onBattleFlip && this.isCombatant(seat, battle)) {
+        try { await skills.onBattleFlip(this, seat, battle); } catch (error) { console.error(error); }
       }
     }
 
@@ -814,99 +1121,173 @@ class XianjianGame {
     this.emit();
     const ctx = { battle, trigger, monster: mon };
     if (battle.winnerSide === trigger.faction) {
-      try { await R.MONSTER_EFFECTS[mon.id]?.win?.(this, ctx); } catch (e) { console.error(e); }
-      if (!battle.escaped && !this.over) this._gainPet(trigger, mon);
+      try { await R.MONSTER_EFFECTS[mon.id]?.win?.(this, ctx); } catch (error) { console.error(error); }
+      if (!battle.escaped && !this.over) await this._gainPet(trigger, mon);
     } else {
-      try { await R.MONSTER_EFFECTS[mon.id]?.lose?.(this, ctx); } catch (e) { console.error(e); }
+      try { await R.MONSTER_EFFECTS[mon.id]?.lose?.(this, ctx); } catch (error) { console.error(error); }
     }
     if (this.over) return;
 
-    // 嫉恶如仇等战斗结束技能
-    for (const s of this.aliveSeats()) {
-      const sk = R.skillsOf(s);
-      if (sk.onBattleEnd) {
-        try { await sk.onBattleEnd(this, s, battle); } catch (e) { console.error(e); }
+    for (const seat of this.aliveSeats()) {
+      const skills = R.skillsOf(seat);
+      if (skills.onBattleEnd) {
+        try { await skills.onBattleEnd(this, seat, battle); } catch (error) { console.error(error); }
       }
+    }
+    if (battle.winnerSide !== trigger.faction && !battle.monsterClaimed) {
+      this.monsterDiscard.push(mon);
     }
     if (this.over) return;
 
     await this._finishBattle(battle);
   }
 
-  /** 触发方阵营='a'侧？统一按“触发方/怪物方”计算战力再映射到展示 */
-  battlePower(battle, sideKey) {
-    // sideKey: 'a'=触发方阵营合计；'b'=怪物方合计
+  async _runBattleStartSkills(battle) {
     const trigger = battle.trigger;
-    let a = this.effPower(trigger);
-    if (battle.supporter && battle.supporterHit) {
-      a += this.effPower(battle.supporter) + (battle.supporterBonus || 0);
+    if (trigger.char?.id === 'XJ202' && !trigger._cunningUsedThisTurn) {
+      let answer = { key: 'pass' };
+      if (this.monsterDeck.length) {
+        answer = await this.ask(trigger.id, {
+          kind: 'character_skill',
+          data: {
+            reason: '【狡猾】是否弃置当前怪兽并重新翻取？若不使用，本场自身战力+1。',
+            options: [{ key: 'sumei_cunning' }, { key: 'pass' }],
+          },
+          validate: (value) => value && ['sumei_cunning', 'pass'].includes(value.key),
+          botFn: () => ({ key: 'pass' }),
+        });
+      }
+      if (answer?.key === 'sumei_cunning' && this.monsterDeck.length) {
+        trigger._cunningUsedThisTurn = true;
+        this.monsterDiscard.push(battle.monster);
+        battle.monster = this.monsterDeck.pop();
+        const monster = battle.monster;
+        this.lastMonster = { name: monster.name, power: monster.power, element: monster.elements.name, by: trigger.name };
+        this.log(`【狡猾】${trigger.name} 弃置原怪兽，重新翻开【${monster.name}】。`);
+      } else {
+        battle.characterPowerBonus[trigger.id] = (battle.characterPowerBonus[trigger.id] || 0) + 1;
+        this.log(`【狡猾】${trigger.name} 不重新翻取，本场自身战力+1。`);
+      }
     }
-    // 梦蛇·女娲：梦蛇在场时，其所在阵营战斗战力+2
-    const mengshe = this.seats.find((s) => s.alive && s.char?.id === 'XJ103');
-    if (mengshe) {
-      const mengsheSideIsTrigger = mengshe.faction === trigger.faction;
-      if (mengsheSideIsTrigger === (sideKey === 'a')) a += 2;
+
+    for (const seat of [battle.trigger, battle.supporter, battle.obstructer].filter((item) => item?.alive && item.char?.id === 'XJ201')) {
+      let rolling = true;
+      while (rolling && seat.alive) {
+        const raw = 1 + Math.floor(this.random() * 6);
+        const value = raw === 6 ? 1 : raw;
+        battle.rolls[seat.id] = { raw, value };
+        battle.characterPowerBonus[seat.id] = value;
+        this.log(`【发挥不稳定】${seat.name} 掷出 ${raw} 点，本场战力增加 ${value}。`);
+        const options = [{ key: 'pass' }];
+        if (seat.hand.length) options.unshift({ key: 'wang_reroll_card' });
+        if (seat.hp > 0) options.unshift({ key: 'wang_reroll_hp' });
+        const answer = await this.ask(seat.id, {
+          kind: 'character_skill',
+          data: {
+            reason: '【不屈不饶】是否支付一张手牌或1点HP重投？',
+            options,
+            cards: seat.hand.map((card) => ({ uid: card.uid, name: card.name, type: card.type })),
+          },
+          validate: (value) => {
+            if (!value || !options.some((option) => option.key === value.key)) return false;
+            return value.key !== 'wang_reroll_card' || seat.hand.some((card) => card.uid === value.cardUid);
+          },
+          botFn: () => ({ key: 'pass' }),
+        });
+        if (answer.key === 'wang_reroll_card') {
+          const card = seat.hand.find((item) => item.uid === answer.cardUid);
+          if (!card) break;
+          seat.hand.splice(seat.hand.indexOf(card), 1);
+          this.discardPile.push(card);
+          this.log(`【不屈不饶】${seat.name} 弃置【${card.name}】重投。`);
+        } else if (answer.key === 'wang_reroll_hp') {
+          await this.damage(seat, 1, { source: seat, kind: 'cost', bypassHidden: true });
+          if (!seat.alive || seat.hp <= 0) break;
+          this.log(`【不屈不饶】${seat.name} 支付1点HP重投（隐蛊无效）。`);
+        } else {
+          rolling = false;
+        }
+      }
     }
+  }
+
+  /** sideKey: a=触发方，b=怪物方；同名角色实例的在场加成分别叠加。 */
+  battlePower(battle, sideKey) {
+    if (!battle?.trigger) return 0;
+    const triggerFaction = battle.trigger.faction;
+    const faction = sideKey === 'a' ? triggerFaction : this.enemyFactionOf(triggerFaction);
+    const rolePower = (seat) => {
+      let value = this.effPower(seat);
+      value += battle.characterPowerBonus?.[seat.id] || 0;
+      value += battle.warPersonal?.[seat.id] || 0;
+      if (seat.char?.id === 'XJ107' && this.isCombatant(seat, battle)
+        && [4, 5].includes(battle.monster?.elements?.id)) value += 2;
+      return value;
+    };
+
+    let total = battle.warBonus?.[faction] || 0;
     if (sideKey === 'a') {
-      a += battle.warBonus[trigger.faction];
-      a += battle.warPersonal[trigger.id] || 0;
-      if (battle.supporter) a += battle.warPersonal[battle.supporter.id] || 0;
-      return a;
+      total += rolePower(battle.trigger);
+      if (battle.supporter?.alive && battle.supporterHit) total += rolePower(battle.supporter) + (battle.supporterBonus || 0);
+    } else {
+      total += battle.monster?.power || 0;
+      if (battle.obstructer?.alive && battle.obstructerHit) total += rolePower(battle.obstructer);
     }
-    // 怪物方
-    let b = battle.monster ? battle.monster.power : 0;
-    if (battle.obstructer && battle.obstructerHit) b += this.effPower(battle.obstructer);
-    const enemyFk = this.enemyFactionOf(trigger.faction);
-    b += battle.warBonus[enemyFk];
-    if (battle.obstructer) b += battle.warPersonal[battle.obstructer.id] || 0;
-    return b;
+
+    total += this.aliveSeats(faction).filter((seat) => seat.char?.id === 'XJ103').length * 2;
+    const shenCount = this.aliveSeats(faction).filter((seat) => seat.char?.id === 'XJ203').length;
+    const missingOrMissed = sideKey === 'a'
+      ? !battle.supporter || !battle.supporterHit
+      : !battle.obstructer || !battle.obstructerHit;
+    if (missingOrMissed) total += shenCount * 3;
+    return total;
   }
 
   async _warCardsLoop(battle) {
-    // 双方所有存活玩家各有一次出牌机会，阵营交替指定出牌玩家（两步：决策人指定 → 出牌人选择）
     while (!battle.escaped && !this.over) {
       const side = battle.warTurnSide;
-      const remain = this.aliveSeats(side).map((s) => s.id).filter((id) => !battle.actedWar.includes(id));
+      const remain = this.aliveSeats(side).map((seat) => seat.id).filter((id) => !battle.actedWar.includes(id));
       if (!remain.length) {
         const other = this.enemyFactionOf(side);
-        const remainOther = this.aliveSeats(other).map((s) => s.id).filter((id) => !battle.actedWar.includes(id));
-        if (!remainOther.length) break; // 全员行动完毕
+        const remainOther = this.aliveSeats(other).map((seat) => seat.id).filter((id) => !battle.actedWar.includes(id));
+        if (!remainOther.length) break;
         battle.warTurnSide = other;
         continue;
       }
       const decider = this.factionDecider(side);
-      const pid = await this.ask(decider.id, {
+      const playerId = await this.ask(decider.id, {
         kind: 'war_pick_player',
-        data: { reason: `战牌阶段：为${this.factionName(side)}指定一名玩家出战牌`, candidates: remain },
+        data: { reason: `战牌阶段：为${this.factionName(side)}指定一名玩家行动`, candidates: remain },
         botFn: () => this._botWarPick(battle, remain),
       });
-      const seat = this.seatById(pid);
-      if (!seat || seat.faction !== side || battle.actedWar.includes(pid)) continue;
-      battle.actedWar.push(pid);
+      const seat = this.seatById(playerId);
+      if (!seat?.alive || seat.faction !== side || battle.actedWar.includes(playerId)) continue;
+      battle.actedWar.push(playerId);
 
-      const legal = seat.hand
-        .filter((c) => c.type === CARD_TYPE.WAR && this._warCardLegal(seat, c, battle))
-        .map((c) => ({ uid: c.uid, name: c.name, desc: c.desc, needTargetSide: !!R.WAR_CARDS[c.id]?.needTargetSide }));
-      const ans = await this.ask(seat.id, {
+      const blockWarCard = await this._warSkillWindow(seat, battle);
+      if (this.over || battle.escaped) break;
+      const legal = blockWarCard ? [] : seat.hand
+        .filter((card) => card.type === CARD_TYPE.WAR && this._warCardLegal(seat, card, battle))
+        .map((card) => ({ uid: card.uid, name: card.name, desc: card.desc, needTargetSide: !!R.WAR_CARDS[card.id]?.needTargetSide }));
+      const answer = await this.ask(seat.id, {
         kind: 'war_play_card',
-        data: { reason: '选择要打出的战牌（可不出）', legal },
+        data: { reason: blockWarCard ? '本场已发动【召唤水魔兽】，不可再使用战牌。' : '选择要打出的战牌（可不出）', legal },
         botFn: () => (legal.length ? { uid: legal[0].uid, targetSide: seat.faction } : { pass: true }),
       });
 
-      if (ans && ans.uid && !ans.pass) {
-        const idx = seat.hand.findIndex((c) => c.uid === ans.uid);
-        if (idx >= 0) {
-          const card = seat.hand[idx];
-          if (this._warCardLegal(seat, card, battle)) {
-            seat.hand.splice(idx, 1);
-            this.log(`${seat.name} 打出战牌【${card.name}】！`);
+      if (answer?.uid && !answer.pass) {
+        const index = seat.hand.findIndex((card) => card.uid === answer.uid);
+        const card = seat.hand[index];
+        if (index >= 0 && this._warCardLegal(seat, card, battle)) {
+          seat.hand.splice(index, 1);
+          this.log(`${seat.name} 打出战牌【${card.name}】！`);
+          const cancelled = await this._askCounter(seat, card);
+          if (!cancelled) {
             const def = R.WAR_CARDS[card.id];
-            const targetSide = ans.targetSide === 'a' || ans.targetSide === 'b' ? ans.targetSide : seat.faction;
-            try { await def?.run(this, { seat, battle, targetSide }); } catch (e) { console.error(e); }
-            this.discardPile.push(card);
-          } else {
-            this.log(`${seat.name} 的【${card.name}】不满足使用条件，未生效。`);
+            const targetSide = ['a', 'b'].includes(answer.targetSide) ? answer.targetSide : seat.faction;
+            try { await def.run(this, { seat, battle, targetSide }); } catch (error) { console.error(error); }
           }
+          this.discardPile.push(card);
         }
       } else {
         this.log(`${seat.name} 选择不出战牌。`);
@@ -914,6 +1295,74 @@ class XianjianGame {
       battle.warTurnSide = this.enemyFactionOf(side);
       this.emit();
     }
+  }
+
+  async _warSkillWindow(seat, battle) {
+    let blockWarCard = false;
+    while (seat.alive && !this.over) {
+      const options = [{ key: 'pass' }];
+      if (seat.char?.id === 'XJ107' && this.isCombatant(seat, battle)
+        && !battle.skillUses[`bayue_summon:${seat.id}`] && seat.hand.length >= 2) {
+        options.unshift({ key: 'bayue_summon' });
+      }
+      const hit = seat.id === battle.trigger.id
+        || (seat.id === battle.supporter?.id && battle.supporterHit)
+        || (seat.id === battle.obstructer?.id && battle.obstructerHit);
+      if (seat.char?.id === 'XJ302' && this.isCombatant(seat, battle) && hit
+        && seat.hand.some((card) => card.type !== CARD_TYPE.WAR)) options.unshift({ key: 'tang_combo' });
+      if (seat.char?.id === 'XJ302' && this.isCombatant(seat, battle)
+        && !battle.skillUses[`tang_compete:${seat.id}`]) options.unshift({ key: 'tang_compete' });
+      if (options.length === 1) return blockWarCard;
+
+      const answer = await this.ask(seat.id, {
+        kind: 'war_character_skill',
+        data: {
+          reason: '可发动战牌阶段角色技能，或选择完成。',
+          options,
+          cards: seat.hand.map((card) => ({ uid: card.uid, name: card.name, type: card.type })),
+        },
+        validate: (value) => this._validateWarSkillAnswer(seat, battle, options, value),
+        botFn: () => ({ key: 'pass' }),
+      });
+      if (answer.key === 'pass') return blockWarCard;
+      const cards = (answer.cardUids || []).map((uid) => seat.hand.find((card) => card.uid === uid)).filter(Boolean);
+      if (answer.key === 'bayue_summon') {
+        for (const card of cards) {
+          seat.hand.splice(seat.hand.indexOf(card), 1);
+          this.discardPile.push(card);
+        }
+        battle.skillUses[`bayue_summon:${seat.id}`] = true;
+        battle.warBonus[seat.faction] += 5;
+        blockWarCard = true;
+        this.log(`【召唤水魔兽】${seat.name} 弃置2张手牌，本方战力+5，且本场不可使用战牌。`);
+        return true;
+      }
+      if (answer.key === 'tang_combo') {
+        for (const card of cards) {
+          seat.hand.splice(seat.hand.indexOf(card), 1);
+          this.discardPile.push(card);
+        }
+        battle.warPersonal[seat.id] = (battle.warPersonal[seat.id] || 0) + cards.length * 2;
+        this.log(`【连击】${seat.name} 弃置${cards.length}张非战牌，本场自身战力+${cards.length * 2}。`);
+      }
+      if (answer.key === 'tang_compete') {
+        battle.skillUses[`tang_compete:${seat.id}`] = true;
+        this.log(`【好胜】${seat.name} 支付2点HP（隐蛊无效）并补2张牌。`);
+        await this.damage(seat, 2, { source: seat, kind: 'cost', bypassHidden: true });
+        if (seat.alive) this.drawCards(seat, 2);
+      }
+    }
+    return blockWarCard;
+  }
+
+  _validateWarSkillAnswer(seat, battle, options, answer) {
+    if (!answer || !options.some((option) => option.key === answer.key)) return false;
+    if (answer.key === 'pass' || answer.key === 'tang_compete') return true;
+    if (!Array.isArray(answer.cardUids) || new Set(answer.cardUids).size !== answer.cardUids.length) return false;
+    const cards = answer.cardUids.map((uid) => seat.hand.find((card) => card.uid === uid));
+    if (cards.some((card) => !card)) return false;
+    if (answer.key === 'bayue_summon') return cards.length === 2;
+    return answer.key === 'tang_combo' && cards.length >= 1 && cards.every((card) => card.type !== CARD_TYPE.WAR);
   }
 
   _botWarPick(battle, remain) {
@@ -941,22 +1390,41 @@ class XianjianGame {
     return true;
   }
 
-  /** 收为宠物：同五行只能留一只（保留新宠，旧宠弃置） */
-  _gainPet(seat, monster) {
-    const elem = monster.elements.id;
-    const dup = seat.pets.find((p) => p.elements.id === elem);
-    if (dup) {
-      this.monsterDiscard.push(dup);
-      seat.pets.splice(seat.pets.indexOf(dup), 1);
-      this.log(`${seat.name} 已有${monster.elements.name}属性宠物【${dup.name}】，只能保留一只——【${dup.name}】被弃至怪兽弃牌堆。`);
+  /** 收为宠物：同五行冲突时由获得者选择保留哪一个。 */
+  async _gainPet(seat, monster) {
+    const duplicate = seat.pets.find((pet) => pet.elements.id === monster.elements.id);
+    if (duplicate) {
+      const kept = await this.askChoosePet(seat, [duplicate, monster], {
+        reason: `已有${monster.elements.name}属性宠物，只能保留一只`,
+      });
+      const discarded = kept?.uid === monster.uid ? duplicate : monster;
+      this.monsterDiscard.push(discarded);
+      if (discarded.uid === monster.uid) {
+        this.log(`${seat.name} 选择保留【${duplicate.name}】，新获得的【${monster.name}】进入怪兽弃牌堆。`);
+        return;
+      }
+      seat.pets.splice(seat.pets.indexOf(duplicate), 1);
     }
     seat.pets.push(monster);
+    if (this.battle?.monster?.uid === monster.uid) this.battle.monsterClaimed = true;
     const bonus = R.PET_BONUS[monster.id];
-    this.log(`${seat.name} 将【${monster.name}】收为宠物！${bonus ? `宠物效果：${monster.pets}` : ''}（阵营得分 +${monster.power}）`);
+    this.log(`${seat.name} 将【${monster.name}】收为宠物！${bonus ? `宠物效果：${monster.pets}` : ''}（基础阵营分 +${monster.power}）`);
+
+    for (const purple of this.aliveSeats(seat.faction).filter((ally) => ally.char?.id === 'XJ305')) {
+      const target = await this.askChoosePlayer(purple, this.aliveSeats(), { reason: '【关爱】我方得到宠物，请指定一人补2张手牌' });
+      if (!target) continue;
+      this.drawCards(target, 2);
+      this.log(`【关爱】${purple.name} 指定 ${target.name} 补2张手牌。`);
+    }
   }
 
   async _finishBattle(battle) {
     battle.trigger._battleCount = (battle.trigger._battleCount || 0) + 1;
+    if (battle.escaped && battle.monster && !battle.monsterClaimed) {
+      this.monsterDiscard.push(battle.monster);
+      battle.monsterClaimed = true;
+      this.log(`【${battle.monster.name}】因【金蝉脱壳】进入怪兽弃牌堆。`);
+    }
     this.battle = null;
     this.emit();
     if (this.over) return;
@@ -966,115 +1434,17 @@ class XianjianGame {
     await this._settleIfMonsterEmpty();
     if (this.over) return;
 
-    // 酒剑仙·醉仙望月步：可触发第二场战斗
     const seat = this.currentSeat();
     if (seat && this.hasSkill(seat, '醉仙望月步') && !battle.extraBattle && !battle.skipped && this.monsterDeck.length) {
-      const again = await this.ask(seat.id, {
-        kind: 'yes_no',
-        data: { reason: '【醉仙望月步】是否再触发一场战斗？' },
-        botFn: () => false,
-      });
+      const again = await this.askYesNo(seat, { reason: '【醉仙望月步】是否再触发一场战斗？', defaultValue: false });
       if (again) {
-        const second = {
-          trigger: seat, supporter: null, obstructer: null, monster: null,
-          stage: 'confirm', skipped: false, escaped: false,
-          supporterHit: false, obstructerHit: false, supporterBonus: 0,
-          warBonus: { a: 0, b: 0 }, warPersonal: {}, warDouble: {},
-          actedWar: [], firstWarSide: null, winnerSide: null, extraBattle: true,
-        };
-        this.battle = second;
-        this.emit();
         this.log(`【醉仙望月步】${seat.name} 再战一场！`);
-        // 第二场直接开战（已确认过），从指定参战者开始
-        await this._runBattleFromRoles(second);
+        await this.runBattlePhase(seat, { skipConfirm: true, extraBattle: true });
         return;
       }
     }
     this.phase = 'draw';
     this.emit();
-  }
-
-  /** 第二场战斗：跳过开始确认，直接指定参战者 */
-  async _runBattleFromRoles(battle) {
-    if (this.over) return;
-    const trigger = battle.trigger;
-    const enemySide = this.enemyFactionOf(trigger.faction);
-    battle.stage = 'roles';
-    this.emit();
-    const allies = this.aliveSeats(trigger.faction).filter((s) => s.id !== trigger.id);
-    if (allies.length) {
-      const sid = await this.ask(trigger.id, {
-        kind: 'pick_supporter',
-        data: { reason: '指定一名队友作为支援者参战', candidates: allies.map((s) => s.id) },
-        botFn: () => allies.sort((x, y) => this.effPower(y) - this.effPower(x))[0].id,
-      });
-      battle.supporter = this.seatById(sid) || null;
-    }
-    const enemies = this.aliveSeats(enemySide);
-    if (enemies.length) {
-      const decider = this.factionDecider(enemySide);
-      const oid = await this.ask(decider?.id || enemies[0].id, {
-        kind: 'pick_obstructer',
-        data: { reason: '指定一名本方玩家作为妨碍者参战', candidates: enemies.map((s) => s.id) },
-        botFn: () => enemies.sort((x, y) => this.effPower(y) - this.effPower(x))[0].id,
-      });
-      battle.obstructer = this.seatById(oid) || null;
-    }
-    // 后续与第一场一致：复制主流程
-    battle.stage = 'flip';
-    if (!this.monsterDeck.length) { this.battle = null; this.phase = 'draw'; this.emit(); return; }
-    battle.monster = this.monsterDeck.pop();
-    const mon = battle.monster;
-    this.lastMonster = { name: mon.name, power: mon.power, element: mon.elements.name, by: trigger.name };
-    this.log(`翻取阶段：翻开了怪兽【${mon.name}】（${mon.elements.name}属性·战力${mon.power}·闪避${mon.range}）！`);
-    this.emit();
-    battle.stage = 'appear';
-    try { await R.MONSTER_EFFECTS[mon.id]?.appear?.(this, { battle, trigger, monster: mon }); } catch (e) { console.error(e); }
-    if (this.over) return;
-    if (battle.escaped) return await this._finishBattle(battle);
-    battle.stage = 'hit';
-    this.emit();
-    if (battle.supporter) {
-      let hit = this.effRange(battle.supporter);
-      const sk = R.skillsOf(battle.supporter);
-      if (sk.supportHitBonus) hit += sk.supportHitBonus(this, battle.supporter, battle);
-      battle.supporterHit = hit >= mon.range;
-      this.log(`命中结算：支援者 ${battle.supporter.name} 命中 ${hit} VS 闪避 ${mon.range} —— ${battle.supporterHit ? '成功' : '失败'}。`);
-    }
-    if (battle.obstructer) {
-      const hit = this.effRange(battle.obstructer);
-      battle.obstructerHit = hit >= mon.range;
-      this.log(`命中结算：妨碍者 ${battle.obstructer.name} 命中 ${hit} VS 闪避 ${mon.range} —— ${battle.obstructerHit ? '成功' : '失败'}。`);
-    }
-    battle.stage = 'cards';
-    const a0 = this.battlePower(battle, 'a');
-    const b0 = this.battlePower(battle, 'b');
-    battle.firstWarSide = a0 < b0 ? trigger.faction : this.enemyFactionOf(trigger.faction);
-    battle.warTurnSide = battle.firstWarSide;
-    this.log(`初始战力：触发方 ${a0} VS 怪物方 ${b0}。${this.factionName(battle.firstWarSide)}先出战牌。`);
-    this.emit();
-    await this._warCardsLoop(battle);
-    if (battle.escaped) return await this._finishBattle(battle);
-    battle.stage = 'resolve';
-    const af = this.battlePower(battle, 'a');
-    const bf = this.battlePower(battle, 'b');
-    battle.winnerSide = af >= bf ? trigger.faction : this.enemyFactionOf(trigger.faction);
-    this.log(`战力结算：触发方 ${af} VS 怪物方 ${bf} —— ${battle.winnerSide === trigger.faction ? '触发方胜利！' : '怪物方获胜！'}`);
-    this.emit();
-    battle.stage = 'settle';
-    const ctx = { battle, trigger, monster: mon };
-    if (battle.winnerSide === trigger.faction) {
-      try { await R.MONSTER_EFFECTS[mon.id]?.win?.(this, ctx); } catch (e) { console.error(e); }
-      if (!battle.escaped && !this.over) this._gainPet(trigger, mon);
-    } else {
-      try { await R.MONSTER_EFFECTS[mon.id]?.lose?.(this, ctx); } catch (e) { console.error(e); }
-    }
-    if (this.over) return;
-    for (const s of this.aliveSeats()) {
-      const sk = R.skillsOf(s);
-      if (sk.onBattleEnd) { try { await sk.onBattleEnd(this, s, battle); } catch (e) { console.error(e); } }
-    }
-    await this._finishBattle(battle);
   }
 
   async _settleIfMonsterEmpty() {
@@ -1091,12 +1461,12 @@ class XianjianGame {
   // ================= 补牌阶段 =================
   actionFinishTurn(playerId) {
     const seat = this._guard(playerId, 'draw');
-    if (!seat) return { ok: false, error: '现在不能结束回合。' };
+    if (!seat || this._busy) return { ok: false, error: '现在不能结束回合。' };
     (async () => {
       await this._runLocked(async () => {
         await this.drawPhase(seat);
         if (this.over) return;
-        this._advanceTurn();
+        await this._advanceTurn();
       });
     })();
     return { ok: true };
@@ -1107,9 +1477,8 @@ class XianjianGame {
     if (this.hasSkill(seat, '万蛊蚀天') && !seat.hand.length) {
       this.log(`【万蛊蚀天】${seat.name} 补牌阶段开始时没有手牌！我方全体补 1 张牌，随后其他所有角色 HP-1。`);
       for (const ally of this.aliveSeats(seat.faction)) this.drawCards(ally, 1);
-      for (const other of this.aliveSeats().filter((s) => s.id !== seat.id)) {
-        await this.damage(other, 1, { source: seat, kind: 'skill' });
-      }
+      const others = this.aliveSeats().filter((other) => other.id !== seat.id);
+      await this.damageBatch(others.map((other) => ({ seat: other, amount: 1 })), { source: seat, kind: 'skill' });
       if (this.over) return;
     }
 
@@ -1121,12 +1490,18 @@ class XianjianGame {
       const got = this.drawCards(seat, n);
       this.log(`补牌阶段：${seat.name} 补了 ${got} 张牌。`);
     }
-    // 弃至 3 张
-    while (seat.hand.length > HAND_KEEP) {
-      const i = Math.floor(Math.random() * seat.hand.length);
-      const [c] = seat.hand.splice(i, 1);
-      this.discardPile.push(c);
-      this.log(`${seat.name} 手牌超过 ${HAND_KEEP} 张，弃掉了【${c.name}】。`);
+    const excess = seat.hand.length - HAND_KEEP;
+    if (excess > 0) {
+      const chosen = await this.askChooseCards(seat, seat.hand.slice(), excess, {
+        reason: `回合结束，请选择 ${excess} 张手牌弃置至刚好 ${HAND_KEEP} 张`,
+      });
+      for (const card of chosen) {
+        const index = seat.hand.findIndex((item) => item.uid === card.uid);
+        if (index < 0) continue;
+        seat.hand.splice(index, 1);
+        this.discardPile.push(card);
+        this.log(`${seat.name} 回合末弃置【${card.name}】。`);
+      }
     }
     this.emit();
   }
@@ -1134,22 +1509,36 @@ class XianjianGame {
   _lastBattleSkipped(seat) { return !!seat._battleSkipped; }
   _battlesThisTurn(seat) { return seat._battleCount || 0; }
 
-  _advanceTurn() {
-    do {
-      const cur = this.currentSeat();
-      if (cur && cur.tapped) {
-        cur.tapped = false;
-        this.log(`${cur.name} 的角色处于横置状态，跳过本回合并重置。`);
-      }
-      this.turnIdx = (this.turnIdx + 1) % this.turnOrder.length;
-    } while (!this.seatById(this.turnOrder[this.turnIdx]).alive);
+  async _onTurnStart(seat) {
+    if (!seat) return;
+    seat._battleSkipped = false;
+    seat._battleCount = 0;
+    seat._cunningUsedThisTurn = false;
+    seat._lashTargets = new Set();
+    if (seat.char?.id === 'XJ205') {
+      const drawn = this.drawCards(seat, 1);
+      this.log(`【蓄势待发】${seat.name} 回合开始补充 ${drawn} 张手牌。`);
+    }
+  }
 
-    const next = this.currentSeat();
-    next._battleSkipped = false;
-    next._battleCount = 0;
-    this.phase = 'event';
-    this.log(`—— 轮到 ${next.name}（${next.char?.name}）的回合 ——`);
-    this.emit();
+  async _advanceTurn() {
+    let checked = 0;
+    while (checked++ < this.turnOrder.length * 2) {
+      this.turnIdx = (this.turnIdx + 1) % this.turnOrder.length;
+      const candidate = this.currentSeat();
+      if (!candidate?.alive) continue;
+      if (candidate.tapped) {
+        candidate.tapped = false;
+        this.log(`${candidate.name} 的角色处于横置状态，跳过本回合并重置。`);
+        continue;
+      }
+      await this._onTurnStart(candidate);
+      this.phase = 'event';
+      this.log(`—— 轮到 ${candidate.name}（${candidate.char?.name}）的回合 ——`);
+      this.emit();
+      return;
+    }
+    await this.checkFactionWiped();
   }
 
   _endGame(winnerFaction, reason) {
@@ -1172,7 +1561,7 @@ class XianjianGame {
           winner_faction: winnerFaction, ended_reason: reason,
           detail: JSON.stringify(this.seats.map((s) => ({
             name: s.name, faction: s.faction, char: s.char?.name || '(未选)',
-            score: s.pets.reduce((x, p) => x + p.power, 0), pets: s.pets.length,
+            score: this.petScore(s), pets: s.pets.length,
             hp: Math.max(s.hp, 0), alive: s.alive, isBot: s.isBot,
           }))),
           started_at: this.startedAt,
@@ -1222,7 +1611,7 @@ class XianjianGame {
       if (!seat.char) continue;
       switch (this.phase) {
         case 'event':
-          this.eventDeck.length && Math.random() < 0.6 ? this.actionDrawEvent(seat.id) : this.actionSkipEvent(seat.id);
+          this.eventDeck.length && this.random() < 0.6 ? this.actionDrawEvent(seat.id) : this.actionSkipEvent(seat.id);
           break;
         case 'skill': {
           const equips = seat.hand.filter((c) => c.type === CARD_TYPE.EQUIP);
@@ -1234,7 +1623,7 @@ class XianjianGame {
             if (def.needTarget) return this.aliveSeats().some((t) => t.id !== seat.id);
             return true;
           });
-          if (usable.length && Math.random() < 0.7) {
+          if (usable.length && this.random() < 0.7) {
             const card = usable[0];
             const def = R.SKILL_CARDS[card.id];
             const target = def.needTarget ? this.aliveSeats().find((t) => t.id !== seat.id) : null;
@@ -1300,12 +1689,15 @@ class XianjianGame {
       scores: { a: this.factionScore('a'), b: this.factionScore('b') },
       deckLeft: { monster: this.monsterDeck.length, event: this.eventDeck.length, hand: this.skillDeck.length + this.discardPile.length },
       lastMonster: this.lastMonster,
-      turnPlayerId: this.over ? null : (this.phase === 'pick' ? null : this.currentSeat()?.id),
+      lastDamage: this.lastDamage || null,
+      turnPlayerId: this.over || ['pick', 'pick_order'].includes(this.phase) ? null : this.currentSeat()?.id,
+      turnOrder: this.turnOrder.slice(),
       dice: this.dice,
       firstFaction: this.firstFaction,
+      availableSkills: this._availableSkills(viewerSeat),
 
       // 角色选择阶段
-      pick: this.phase === 'pick' ? this._pickView(viewerSeat) : null,
+      pick: ['pick', 'pick_order'].includes(this.phase) ? this._pickView(viewerSeat) : null,
 
       // 战斗上下文（公开信息）
       battle: b ? {
@@ -1314,14 +1706,20 @@ class XianjianGame {
         supporter: b.supporter ? { id: b.supporter.id, name: b.supporter.name, faction: b.supporter.faction } : null,
         obstructer: b.obstructer ? { id: b.obstructer.id, name: b.obstructer.name, faction: b.obstructer.faction } : null,
         monster: b.monster ? {
-          name: b.monster.name, power: b.monster.power, range: b.monster.range,
+          uid: b.monster.uid, name: b.monster.name, power: b.monster.power, range: b.monster.range,
           element: b.monster.elements.name, type: b.monster.type,
           appear: b.monster.appear, win: b.monster.win, lose: b.monster.lose,
         } : null,
         supporterHit: b.supporterHit,
         obstructerHit: b.obstructerHit,
+        supporterBonus: b.supporterBonus,
+        characterPowerBonus: { ...b.characterPowerBonus },
+        warBonus: { ...b.warBonus },
+        warPersonal: { ...b.warPersonal },
+        skillUses: { ...b.skillUses },
+        rolls: { ...b.rolls },
         warTurnSide: b.warTurnSide || null,
-        actedWar: b.actedWar,
+        actedWar: b.actedWar.slice(),
         powerA: this.battlePower(b, 'a'),
         powerB: this.battlePower(b, 'b'),
         escaped: b.escaped,
@@ -1331,6 +1729,7 @@ class XianjianGame {
 
       // pending 询问（仅目标玩家可见）
       pending: this.pending && this.pending.seatId === viewerId ? {
+        id: this.pending.id,
         kind: this.pending.kind,
         data: this._pendingViewData(),
         deadline: this.pending.deadline,
@@ -1340,6 +1739,34 @@ class XianjianGame {
       players: this.seats.map((s) => this._viewSeat(s, s.id === viewerId)),
       log: this.logEntries.slice(-60),
     };
+  }
+
+  _availableSkills(seat) {
+    if (!seat?.alive || this.over) return [];
+    if (this.pending?.seatId === seat.id && ['character_skill', 'war_character_skill'].includes(this.pending.kind)) {
+      return (this.pending.data.options || []).filter((option) => option.key !== 'pass').map((option) => ({
+        key: option.key,
+        timing: this.pending.kind,
+        pendingId: this.pending.id,
+      }));
+    }
+    if (this.phase !== 'skill' || this.currentSeat()?.id !== seat.id) return [];
+    const available = [];
+    if (seat.char?.id === 'XJ203') {
+      const cards = seat.hand.filter((card) => card.type === CARD_TYPE.SKILL);
+      if (cards.length) available.push({
+        key: 'yuanling_heal',
+        timing: 'skill',
+        cardUids: cards.map((card) => card.uid),
+        targetIds: this.aliveSeats().map((target) => target.id),
+      });
+    }
+    if (seat.char?.id === 'XJ204' && seat.hp >= 2) {
+      const used = seat._lashTargets || new Set();
+      const targets = this.aliveSeats().filter((target) => target.sex === 2 && !used.has(target.id));
+      if (targets.length) available.push({ key: 'kong_lash', timing: 'skill', targetIds: targets.map((target) => target.id) });
+    }
+    return available;
   }
 
   _pendingViewData() {
@@ -1363,6 +1790,8 @@ class XianjianGame {
       currentSide: step?.side || null,
       currentMode: step?.mode || null,
       currentCount: step?.count || 0,
+      takenInCurrentStep: this.pick.stepTaken,
+      remainingInCurrentStep: step ? step.count - this.pick.stepTaken : 0,
       pool: this.pick.pool.map((p) => {
         const visible = p.open || p.owner === viewerSeat?.faction || p.owner === 'discard';
         return {
@@ -1405,7 +1834,7 @@ class XianjianGame {
       offline: s.offline,
       pets: s.pets.map((p) => ({ uid: p.uid, name: p.name, power: p.power, element: p.elements.name, pets: p.pets })),
       equips: s.equips.map((e) => ({ uid: e.card.uid, name: e.card.name, eqvType: e.card.eqvType, desc: e.card.desc })),
-      petScore: s.pets.reduce((x, p) => x + p.power, 0),
+      petScore: this.petScore(s),
       handCount: s.hand.length,
     };
     if (full) base.hand = s.hand;

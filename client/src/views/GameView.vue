@@ -50,35 +50,125 @@ const stageIdx = computed(() => {
 
 // ---------- 手牌 ----------
 const TYPE_LABEL = { 1: '特殊', 2: '装备', 3: '技牌', 4: '战牌' };
-const SKILL_NEED_TARGET = [15, 16, 17, 18];
-const needTarget = (c) => c.type === 3 && SKILL_NEED_TARGET.includes(c.id);
+// 当前四张技牌均由服务端按技牌规则校验目标；前端只负责引导选择。
+const needTarget = (card) => card.type === 3;
 const hasGhost = computed(() => !!(st.value?.you?.char?.skill || []).some((s) => s.name === '鬼灵精'));
-const canPlay = (c) => {
+const availableSkills = computed(() => st.value?.availableSkills || []);
+const yuanlingSkill = computed(() => availableSkills.value.find((skill) => skill.key === 'yuanling_heal'));
+const kongSkill = computed(() => availableSkills.value.find((skill) => skill.key === 'kong_lash'));
+const canPlay = (card) => {
   if (!isMyTurn.value || st.value.phase !== 'skill') return false;
-  if (c.type === 2 || c.type === 3) return true;
-  if (c.type === 1) return c.id === 2; // 灵葫仙丹可自用；冰心诀/隐蛊为响应牌
+  if (card.type === 2 || card.type === 3) return true;
+  if (card.type === 1) return card.id === 2; // 灵葫仙丹可自用；冰心诀/隐蛊为响应牌
   return false;
 };
 
-// 目标选择模式（技牌/赠牌）
-const targeting = ref(null); // { mode: 'skill'|'give', uid }
+// 目标选择模式：技牌、鬼灵精赠牌、主动角色技能均使用同一套可取消交互。
+const targeting = ref(null);
+const targetingHint = computed(() => {
+  const mode = targeting.value?.mode;
+  if (mode === 'give') return '请点击接收手牌的其他存活玩家';
+  if (mode === 'yuanling_cost') return '请先选择一张技牌作为【元灵归心术】的成本';
+  if (mode === 'yuanling') return '请点击服务端允许的存活回复目标';
+  if (mode === 'kong_lash') return '请点击服务端允许的女性目标';
+  if (mode === 'card_zone') return '请选择【铜钱镖】要弃置的区域';
+  return '请点击要指定的存活玩家';
+});
+
+function canPickYuanlingCost(card) {
+  return targeting.value?.mode === 'yuanling_cost'
+    && (targeting.value.cardUids || []).includes(card.uid);
+}
+function isHandCardActionable(card) {
+  if (targeting.value?.mode === 'yuanling_cost') return canPickYuanlingCost(card);
+  return !targeting.value && canPlay(card);
+}
 function startTarget(card) {
-  if (!canPlay(card)) return;
-  if (needTarget(card)) { targeting.value = { mode: 'skill', uid: card.uid }; return; }
+  if (canPickYuanlingCost(card)) {
+    targeting.value = {
+      mode: 'yuanling',
+      cardUid: card.uid,
+      targetIds: targeting.value.targetIds,
+    };
+    return;
+  }
+  if (targeting.value || !canPlay(card)) return;
+  if (needTarget(card)) {
+    targeting.value = { mode: 'skill', uid: card.uid };
+    return;
+  }
   game.action('play_card', { uid: card.uid });
 }
 function startGive(card) {
+  if (targeting.value || !isMyTurn.value || st.value?.phase !== 'skill') return;
   targeting.value = { mode: 'give', uid: card.uid };
 }
-function clickSeat(seat) {
-  if (!targeting.value || seat.id === me.value.id || !seat.alive) return;
-  if (targeting.value.mode === 'skill') {
-    const card = st.value.you.hand.find((c) => c.uid === targeting.value.uid);
-    const kind = card && card.id === 17 ? (seat.equips.length ? 'equip' : 'hand') : undefined;
-    game.action('play_card', { uid: targeting.value.uid, targetId: seat.id, targetKind: kind });
-  } else {
-    game.action('give_card', { uid: targeting.value.uid, toId: seat.id });
+function isCharacterSkillActive(key) {
+  if (key === 'yuanling_heal') return ['yuanling_cost', 'yuanling'].includes(targeting.value?.mode);
+  return targeting.value?.mode === key;
+}
+function activateCharacterSkill(skill) {
+  if (!skill?.key) return;
+  const mode = skill.key === 'yuanling_heal' ? 'yuanling_cost' : skill.key;
+  if (isCharacterSkillActive(skill.key)) {
+    targeting.value = null;
+    return;
   }
+  if (skill.key === 'yuanling_heal') {
+    targeting.value = {
+      mode,
+      cardUids: [...(skill.cardUids || [])],
+      targetIds: [...(skill.targetIds || [])],
+    };
+    return;
+  }
+  targeting.value = { mode, targetIds: [...(skill.targetIds || [])] };
+}
+function isSeatTargetable(seat) {
+  if (!targeting.value || !seat.alive) return false;
+  if (targeting.value.mode === 'give') return seat.id !== me.value.id;
+  if (['yuanling', 'kong_lash'].includes(targeting.value.mode)) {
+    return (targeting.value.targetIds || []).includes(seat.id);
+  }
+  if (targeting.value.mode !== 'skill') return false;
+  const card = st.value?.you?.hand.find((item) => item.uid === targeting.value.uid);
+  if (!card) return false;
+  if (card.id === 16) return seat.handCount > 0;
+  if (card.id === 17) return seat.handCount > 0 || seat.equips.length > 0;
+  return true;
+}
+function clickSeat(seat) {
+  if (!isSeatTargetable(seat)) return;
+  if (targeting.value.mode === 'skill') {
+    const card = st.value.you.hand.find((item) => item.uid === targeting.value.uid);
+    if (card?.id === 17) {
+      const zones = [];
+      if (seat.handCount > 0) zones.push('hand');
+      if (seat.equips.length > 0) zones.push('equip');
+      if (zones.length > 1) {
+        targeting.value = { mode: 'card_zone', uid: card.uid, targetId: seat.id, zones };
+        return;
+      }
+      game.action('play_card', { uid: card.uid, targetId: seat.id, targetKind: zones[0] });
+    } else {
+      game.action('play_card', { uid: targeting.value.uid, targetId: seat.id });
+    }
+  } else if (targeting.value.mode === 'give') {
+    game.action('give_card', { uid: targeting.value.uid, toId: seat.id });
+  } else if (targeting.value.mode === 'yuanling') {
+    game.useCharacterSkill('yuanling_heal', { cardUid: targeting.value.cardUid, targetId: seat.id });
+  } else if (targeting.value.mode === 'kong_lash') {
+    game.useCharacterSkill('kong_lash', { targetId: seat.id });
+  }
+  targeting.value = null;
+}
+function chooseCardZone(targetKind) {
+  if (targeting.value?.mode !== 'card_zone' || !targeting.value.zones.includes(targetKind)) return;
+  game.action('play_card', {
+    uid: targeting.value.uid,
+    targetId: targeting.value.targetId,
+    targetKind,
+  });
   targeting.value = null;
 }
 function cancelTargeting() { targeting.value = null; }
@@ -204,7 +294,7 @@ const resultPlayers = computed(() =>
               <h3>{{ factionName(f) }} <em>{{ st.scores[f] }} 分</em></h3>
               <SeatPanel v-for="s in seatsBy(f)" :key="s.id" :seat="s"
                          :is-you="s.id === me.id" :is-turn="s.id === st.turnPlayerId"
-                         :targetable="!!targeting && s.id !== me.id && s.alive"
+                         :targetable="isSeatTargetable(s)"
                          @click="clickSeat(s)" />
             </div>
             <div class="deck-box panel">
@@ -249,17 +339,25 @@ const resultPlayers = computed(() =>
               <div class="label">
                 手牌（{{ st.you.hand.length }}/{{ st.handKeep }}+）
                 <template v-if="targeting">
-                  <span class="targeting-hint">→ 请点击要指定{{ targeting.mode === 'give' ? '接收' : '' }}的玩家</span>
+                  <span class="targeting-hint">→ {{ targetingHint }}</span>
+                  <template v-if="targeting.mode === 'card_zone'">
+                    <button v-for="zone in targeting.zones" :key="zone" class="btn tiny"
+                            @click="chooseCardZone(zone)">{{ zone === 'hand' ? '手牌区' : '装备区' }}</button>
+                  </template>
                   <button class="btn ghost tiny" @click="cancelTargeting">取消</button>
                 </template>
               </div>
               <div class="hand">
                 <div v-for="c in st.you.hand" :key="c.uid"
-                     :class="['hand-slot', `ht-${c.type}`, { playable: canPlay(c), targeting: targeting?.uid === c.uid }]"
+                     :class="['hand-slot', `ht-${c.type}`, {
+                       playable: isHandCardActionable(c),
+                       targeting: targeting?.uid === c.uid || targeting?.cardUid === c.uid,
+                       'cost-selectable': canPickYuanlingCost(c),
+                     }]"
                      @click="startTarget(c)">
                   <CardFace :card="c" mini />
                   <span class="kind-tag">{{ TYPE_LABEL[c.type] }}</span>
-                  <button v-if="hasGhost && isMyTurn && st.phase === 'skill' && targeting?.mode !== 'give'"
+                  <button v-if="hasGhost && isMyTurn && st.phase === 'skill' && !targeting"
                           class="give-btn" title="鬼灵精：将此牌赠予他人"
                           @click.stop="startGive(c)">赠</button>
                 </div>
@@ -275,7 +373,19 @@ const resultPlayers = computed(() =>
                 </template>
                 <template v-else-if="st.phase === 'skill'">
                   <span class="hint">点手牌出牌/装备（需指定目标的牌：先点牌再点玩家）</span>
-                  <button class="btn primary" @click="act('go_battle')">进入战斗阶段 →</button>
+                  <div v-if="yuanlingSkill || kongSkill" class="skill-actions">
+                    <button v-if="yuanlingSkill" class="btn skill-action"
+                            :class="{ primary: isCharacterSkillActive('yuanling_heal') }"
+                            @click="activateCharacterSkill(yuanlingSkill)">
+                      {{ isCharacterSkillActive('yuanling_heal') ? '取消【元灵归心术】' : '发动【元灵归心术】' }}
+                    </button>
+                    <button v-if="kongSkill" class="btn skill-action"
+                            :class="{ primary: isCharacterSkillActive('kong_lash') }"
+                            @click="activateCharacterSkill(kongSkill)">
+                      {{ isCharacterSkillActive('kong_lash') ? '取消【辣手摧花】' : '发动【辣手摧花】' }}
+                    </button>
+                  </div>
+                  <button class="btn primary" :disabled="!!targeting" @click="act('go_battle')">进入战斗阶段 →</button>
                 </template>
                 <template v-else-if="st.phase === 'battle'">
                   <span class="hint">战斗进行中，请按弹窗指引操作…</span>
@@ -437,6 +547,7 @@ const resultPlayers = computed(() =>
 .hand-slot { position: relative; transition: transform .12s ease; }
 .hand-slot.playable { cursor: pointer; }
 .hand-slot.playable:hover { transform: translateY(-6px) scale(1.03); }
+.hand-slot.cost-selectable { border-radius: 12px; box-shadow: 0 0 0 2px var(--jade); }
 .hand-slot.targeting { transform: translateY(-6px); box-shadow: 0 0 0 2px var(--red); border-radius: 12px; }
 .kind-tag {
   position: absolute; right: -4px; top: -7px; font-size: 10px;
@@ -455,6 +566,8 @@ const resultPlayers = computed(() =>
 .empty-hand { color: var(--dim); font-size: 13px; align-self: center; }
 
 .actions-col { display: flex; flex-direction: column; gap: 10px; justify-content: center; }
+.skill-actions { display: flex; flex-direction: column; gap: 7px; }
+.skill-action { width: 100%; }
 .hint { font-size: 12px; color: var(--dim); line-height: 1.6; }
 
 /* ---------- 日志 ---------- */

@@ -12,7 +12,7 @@ const CARD_TYPE_NAME = { 1: '特殊牌', 2: '装备牌', 3: '技牌', 4: '战牌
 // ---------- 装备属性 ----------
 const EQUIP_STATS = {
   5: { power: 2, range: 0 },   // 魔刀天吒：战力+2
-  6: { power: 1, range: 0 },   // 无尘剑：战力+1
+  6: { power: 1, range: 1 },   // 无尘剑：战力+1，命中+1
   8: { power: 0, range: 2 },   // 彩环：命中+2
   10: { power: 1, range: 0 },  // 五彩霞衣：战力+1
   11: { power: 1, range: 0 },  // 乾坤道袍：战力+1
@@ -31,7 +31,7 @@ const SKILL_CARDS = {
     needTarget: true,
     async run(game, { seat, target }) {
       if (!target.hand.length) { game.log(`${target.name} 没有手牌，【偷盗】落空。`); return; }
-      const i = Math.floor(Math.random() * target.hand.length);
+      const i = Math.floor(game.random() * target.hand.length);
       const [c] = target.hand.splice(i, 1);
       seat.hand.push(c);
       game.log(`${seat.name} 使用【偷盗】，抽走了 ${target.name} 的 1 张手牌。`);
@@ -41,17 +41,15 @@ const SKILL_CARDS = {
     needTarget: true,
     async run(game, { seat, target, targetKind }) {
       const equips = game.equipsOf(target);
-      let kind = targetKind || (equips.length ? 'equip' : 'hand');
-      if (kind === 'equip' && !equips.length) kind = 'hand';
-      if (kind === 'equip') {
-        const eq = equips[Math.floor(Math.random() * equips.length)];
+      if (targetKind === 'equip') {
+        const eq = equips[Math.floor(game.random() * equips.length)];
         game.unequip(target, eq);
         game.discardPile.push(eq.card);
         game.log(`${seat.name} 使用【铜钱镖】，弃掉了 ${target.name} 的装备【${eq.card.name}】。`);
         return;
       }
       if (!target.hand.length) { game.log(`${target.name} 没有手牌，【铜钱镖】落空。`); return; }
-      const i = Math.floor(Math.random() * target.hand.length);
+      const i = Math.floor(game.random() * target.hand.length);
       const [c] = target.hand.splice(i, 1);
       game.discardPile.push(c);
       game.log(`${seat.name} 使用【铜钱镖】，弃掉了 ${target.name} 的 1 张手牌。`);
@@ -120,8 +118,11 @@ const WAR_CARDS = {
 const MONSTER_EFFECTS = {
   MO001: {
     async win(game, { trigger }) {
-      const t = await game.askChoosePlayer(trigger, game.aliveSeats(), { reason: '积粮隐者：指定一名玩家HP+2' });
-      if (t) { t.hp = Math.min(t.hp + 2, t.maxHp); game.log(`【积粮隐者】胜利结算：${t.name} HP+2。`); }
+      const target = await game.askChoosePlayer(trigger, game.aliveSeats(), { reason: '积粮隐者：指定一名玩家HP+2' });
+      if (target) {
+        target.hp = Math.min(target.hp + 2, target.maxHp);
+        game.log(`【积粮隐者】胜利结算：${target.name} HP+2。`);
+      }
     },
     async lose(game, { trigger }) {
       game.log(`【积粮隐者】失败结算：${trigger.name} HP-3。`);
@@ -136,14 +137,17 @@ const MONSTER_EFFECTS = {
       }
     },
     async win(game, { trigger }) {
-      const t = await game.askChoosePlayer(trigger, game.aliveSeats(), { reason: '赤鬼王：指定一名玩家补2张牌' });
-      if (t) { game.drawCards(t, 2); game.log(`【赤鬼王】胜利结算：${t.name} 补 2 张牌。`); }
+      const target = await game.askChoosePlayer(trigger, game.aliveSeats(), { reason: '赤鬼王：指定一名玩家补2张牌' });
+      if (target) {
+        game.drawCards(target, 2);
+        game.log(`【赤鬼王】胜利结算：${target.name} 补 2 张牌。`);
+      }
     },
     async lose(game, { trigger }) {
-      game.log(`【赤鬼王】失败结算：${trigger.name} HP-2，失去全部装备并补充等量手牌。`);
-      const lost = game.unequipAll(trigger);
-      for (const eq of lost) game.discardPile.push(eq);
+      game.log(`【赤鬼王】失败结算：${trigger.name} 先受到 2 点伤害，再失去全部装备并补充等量手牌。`);
       await game.damage(trigger, 2, { kind: 'monster', element: '雷' });
+      const lost = game.unequipAll(trigger);
+      for (const card of lost) game.discardPile.push(card);
       game.drawCards(trigger, lost.length);
       if (lost.length) game.log(`${trigger.name} 失去了 ${lost.length} 件装备，补了 ${lost.length} 张手牌。`);
     },
@@ -160,70 +164,116 @@ const MONSTER_EFFECTS = {
   },
   MO008: {
     async win(game, { trigger }) {
-      // 敌方一人HP+2（由敌方任选）→ 由敌方阵营决策人选择
       const enemySide = game.enemyFactionOf(trigger.faction);
       const decider = game.factionDecider(enemySide);
-      const t = decider ? await game.askChoosePlayer(decider, game.aliveSeats(enemySide), { reason: '蝶精：敌方任选一人HP+2' }) : null;
-      if (t) { t.hp = Math.min(t.hp + 2, t.maxHp); game.log(`【蝶精】胜利结算：敌方 ${t.name} HP+2。`); }
+      const target = decider
+        ? await game.askChoosePlayer(decider, game.aliveSeats(enemySide), { reason: '蝶精：敌方任选一人HP+2' })
+        : null;
+      if (target) {
+        target.hp = Math.min(target.hp + 2, target.maxHp);
+        game.log(`【蝶精】胜利结算：敌方 ${target.name} HP+2。`);
+      }
     },
     async lose() { /* 无 */ },
   },
   MO009: {
     async appear(game, { battle }) {
-      const victims = game.seats.filter((s) => s.alive && !game.isCombatant(s, battle));
-      game.log(`【刑天】出场：参战者以外的所有角色HP-（其手牌数）。`);
-      for (const v of victims) {
-        await game.damage(v, v.hand.length, { kind: 'monster', element: '土' });
-      }
+      const victims = game.seats.filter((seat) => seat.alive && !game.isCombatant(seat, battle));
+      game.log('【刑天】出场：参战者以外的所有角色HP-（其手牌数）。');
+      await game.damageBatch(victims.map((seat) => ({ seat, amount: seat.hand.length })), { kind: 'monster', element: '土' });
     },
   },
   MO012: {
-    async lose(game, { trigger, monster }) {
-      // 战斗失败：触发方（此处“敌方”相对怪物方=触发方阵营）有土属性宠物时，可用天鬼皇替换
-      const side = trigger.faction;
-      const holders = game.aliveSeats(side).filter((s) => s.pets.some((p) => p.elements.id === 3));
+    async lose(game, { trigger, monster, battle }) {
+      const holders = game.aliveSeats(trigger.faction).filter((seat) => seat.pets.some((pet) => pet.elements.id === 3));
       if (!holders.length) return;
-      const holder = holders[0];
-      const old = holder.pets.find((p) => p.elements.id === 3);
-      const yes = await game.askYesNo(holder, { reason: `天鬼皇：是否用其替换您的土属性宠物【${old.name}】？` });
-      if (yes) {
-        game.monsterDiscard.push(old);
-        holder.pets.splice(holder.pets.indexOf(old), 1);
-        holder.pets.push(game.instantiateMonster(monster.def));
-        game.log(`【天鬼皇】失败结算：${holder.name} 弃置【${old.name}】，将【天鬼皇】收为宠物。`);
-      }
+      const decider = game.factionDecider(trigger.faction);
+      const holder = holders.length === 1 ? holders[0]
+        : await game.askChoosePlayer(decider, holders, { reason: '天鬼皇：选择一名拥有土属性宠物的角色' });
+      if (!holder) return;
+      const earthPets = holder.pets.filter((pet) => pet.elements.id === 3);
+      const old = earthPets.length === 1 ? earthPets[0]
+        : await game.askChoosePet(holder, earthPets, { reason: '天鬼皇：选择要被替换的土属性宠物' });
+      if (!old) return;
+      const yes = await game.askYesNo(holder, { reason: `是否用【天鬼皇】替换【${old.name}】？` });
+      if (!yes) return;
+      holder.pets.splice(holder.pets.indexOf(old), 1);
+      game.monsterDiscard.push(old);
+      holder.pets.push(monster);
+      battle.monsterClaimed = true;
+      game.log(`【天鬼皇】失败结算：${holder.name} 弃置【${old.name}】，将当前这张【天鬼皇】收为宠物。`);
     },
   },
   MO013: {
     async appear(game, { battle }) {
-      // 触发者和一名妨碍者手牌对调（妨碍者由触发者选，多个妨碍者时取其一；本框架每场仅一名妨碍者）
       const trigger = battle.trigger;
-      const obst = battle.obstructer;
-      if (!obst) return;
-      const a = trigger.hand; trigger.hand = obst.hand; obst.hand = a;
-      game.log(`【千杯不醉】出场：${trigger.name} 与妨碍者 ${obst.name} 手牌对调。`);
+      const obstructer = battle.obstructer;
+      if (!obstructer) return;
+      const hand = trigger.hand;
+      trigger.hand = obstructer.hand;
+      obstructer.hand = hand;
+      game.log(`【千杯不醉】出场：${trigger.name} 与妨碍者 ${obstructer.name} 手牌对调。`);
+    },
+    async lose(game, { trigger }) {
+      trigger.tapped = true;
+      game.log(`【千杯不醉】失败结算：${trigger.name} 的角色横置，将跳过其下一个回合。`);
+    },
+  },
+  MO016: {
+    async win(game, { trigger, battle }) {
+      const enemies = game.aliveSeats(game.enemyFactionOf(trigger.faction));
+      game.log('【水魔兽】胜利结算：敌方全体HP-1。');
+      await game.damageBatch(enemies.map((seat) => ({ seat, amount: 1 })), { kind: 'monster', element: '水' });
+      if (battle.obstructer?.alive) {
+        await game.stealRandomFromNonEmptyZone(trigger, battle.obstructer, '水魔兽：选择从妨碍者的手牌或装备区抽取');
+      }
+    },
+    async lose(game, { trigger, battle }) {
+      game.log(`【水魔兽】失败结算：${trigger.name} HP-2。`);
+      await game.damage(trigger, 2, { kind: 'monster', element: '水' });
+      if (battle.obstructer?.alive && trigger.alive) {
+        await game.stealRandomFromNonEmptyZone(battle.obstructer, trigger, '水魔兽：选择从触发者的手牌或装备区抽取');
+      }
+    },
+  },
+  MO019: {
+    async appear(game, { battle, trigger }) {
+      if (!battle.supporter?.alive) return;
+      const amount = Math.max(0, game.effPower(trigger) - 1);
+      if (!amount) return;
+      game.log(`【狐妖女】出场：支援者 ${battle.supporter.name} HP-${amount}。`);
+      await game.damage(battle.supporter, amount, { kind: 'monster', element: '火' });
+    },
+    async win(game, { battle }) {
+      if (!battle.obstructer?.alive) return;
+      game.log(`【狐妖女】胜利结算：妨碍者 ${battle.obstructer.name} HP-3。`);
+      await game.damage(battle.obstructer, 3, { kind: 'monster', element: '火' });
+    },
+    async lose(game, { trigger }) {
+      const enemySide = game.enemyFactionOf(trigger.faction);
+      const decider = game.factionDecider(enemySide);
+      const candidates = game.aliveSeats();
+      if (!decider || !candidates.length) return;
+      const targets = await game.askChoosePlayers(decider, candidates, 2, { reason: '狐妖女：选择现有最多两名不同的存活角色，各HP-3' });
+      if (!targets.length) return;
+      game.log(`【狐妖女】失败结算：${targets.map((seat) => seat.name).join('、')} HP-3。`);
+      await game.damageBatch(targets.map((seat) => ({ seat, amount: 3 })), { kind: 'monster', element: '火' });
     },
   },
   MO020: {
     async appear(game) {
-      game.log(`【熔岩兽王】出场：全体角色HP-2！`);
-      for (const s of game.aliveSeats()) {
-        await game.damage(s, 2, { kind: 'monster', element: '火' });
-      }
+      game.log('【熔岩兽王】出场：全体角色HP-2！');
+      await game.damageBatch(game.aliveSeats().map((seat) => ({ seat, amount: 2 })), { kind: 'monster', element: '火' });
     },
     async win(game, { trigger }) {
-      const enemySide = game.enemyFactionOf(trigger.faction);
-      game.log(`【熔岩兽王】胜利结算：敌方全体HP-2！`);
-      for (const s of game.aliveSeats(enemySide)) {
-        await game.damage(s, 2, { kind: 'monster', element: '火' });
-      }
+      const enemies = game.aliveSeats(game.enemyFactionOf(trigger.faction));
+      game.log('【熔岩兽王】胜利结算：敌方全体HP-2！');
+      await game.damageBatch(enemies.map((seat) => ({ seat, amount: 2 })), { kind: 'monster', element: '火' });
     },
     async lose(game, { trigger, battle }) {
-      game.log(`【熔岩兽王】失败结算：触发者与支援者HP各-2。`);
-      await game.damage(trigger, 2, { kind: 'monster', element: '火' });
-      if (battle.supporter && battle.supporter.alive) {
-        await game.damage(battle.supporter, 2, { kind: 'monster', element: '火' });
-      }
+      const victims = [trigger, battle.supporter].filter((seat) => seat?.alive);
+      game.log('【熔岩兽王】失败结算：触发者与支援者HP各-2。');
+      await game.damageBatch(victims.map((seat) => ({ seat, amount: 2 })), { kind: 'monster', element: '火' });
     },
   },
 };
@@ -234,6 +284,8 @@ const PET_BONUS = {
   MO009: { range: 1 },           // 主人命中+1
   MO012: { power: 2, range: 1 }, // 主人战力+2，命中+1
   MO013: { power: 1 },           // 主人战力+1
+  MO016: { power: 1, range: 1 }, // 主人战力+1，命中+1
+  MO019: { power: 2 },           // 主人战力+2
   MO020: { power: 2 },           // 主人战力+2
 };
 
@@ -302,7 +354,7 @@ const CHAR_SKILLS = {
       const robFrom = [battle.obstructer].filter(Boolean);
       for (const v of robFrom) {
         if (!v.hand.length) continue;
-        const i = Math.floor(Math.random() * v.hand.length);
+        const i = Math.floor(game.random() * v.hand.length);
         const [c] = v.hand.splice(i, 1);
         seat.hand.push(c);
         game.log(`【飞龙探云手】${seat.name} 抽走了妨碍者 ${v.name} 的 1 张手牌。`);

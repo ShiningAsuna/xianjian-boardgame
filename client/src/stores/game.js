@@ -59,7 +59,13 @@ export const useGameStore = defineStore('game', {
 
     // 引擎询问响应（濒死救援/隐蛊/冰心诀/参战者指定/战牌等）
     submitPending(answer) {
-      this.socket.emit('submit_pending', { answer });
+      const pendingId = this.state?.pending?.id;
+      if (!pendingId) return;
+      this.socket.emit('submit_pending', { pendingId, answer });
+    },
+
+    useCharacterSkill(key, args = {}, pendingId = null) {
+      this.socket.emit('use_character_skill', { key, args, pendingId });
     },
 
     action(type, opts = {}) {

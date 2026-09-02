@@ -11,9 +11,16 @@ const pick = computed(() => game.state?.pick);
 const st = computed(() => game.state);
 const myFaction = computed(() => st.value?.you?.faction);
 const myTurn = computed(() => !!pick.value && pick.value.currentSide === myFaction.value);
+const remainingCount = computed(() => {
+  if (!pick.value) return 0;
+  return pick.value.remainingInCurrentStep
+    ?? Math.max(0, pick.value.currentCount - (pick.value.takenInCurrentStep || 0));
+});
 const modeText = computed(() => {
   if (!pick.value) return '';
-  return pick.value.currentMode === 'discard' ? '弃置一张角色牌' : `选择角色（本轮 ${pick.value.currentCount} 张）`;
+  return pick.value.currentMode === 'discard'
+    ? '弃置一张角色牌'
+    : `选择角色（本轮还需 ${remainingCount.value} 张）`;
 });
 const stepText = computed(() => {
   if (!pick.value) return '';
